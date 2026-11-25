@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -19,9 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence, TextIO
 
-from . import __version__
+from . import __version__, dates
 from .model import DEFAULT_BOARD, Item
-from .pad import Pad
+from .pad import Pad, order_subtasks
 from .store import Store, StoreError
 
 _RESET = "\x1b[0m"
@@ -100,33 +101,54 @@ def _paint(text: str, code: str, color: bool) -> str:
     return f"{code}{text}{_RESET}" if color else text
 
 
+def _due_marker(item: Item, now: datetime | None = None) -> str:
+    if not item.due:
+        return ""
+    if dates.is_overdue(item.due, now_=now):
+        return "overdue:" + dates.format_when(item.due)
+    return "due:" + dates.format_when(item.due)
+
+
+def _item_code(item: Item, now: datetime | None = None) -> str:
+    if item.kind == "note":
+        return _DIM
+    if item.status != "done" and dates.is_overdue(item.due, now_=now):
+        return _RED
+    return {
+        "done": _GREEN,
+        "in_progress": _YELLOW,
+        "pending": _RED if item.priority == 3 else _BLUE if item.priority == 2 else "",
+    }.get(item.status or "pending", "")
+
+
 def _format_item(
     item: Item,
     symbols: dict[str, str],
     color: bool,
     *,
     show_boards: bool = False,
+    depth: int = 0,
+    now: datetime | None = None,
 ) -> str:
     if item.kind == "note":
         symbol = symbols["note"]
-        code = _DIM
     else:
         symbol = symbols[item.status or "pending"]
-        code = {
-            "done": _GREEN,
-            "in_progress": _YELLOW,
-            "pending": _RED if item.priority == 3 else _BLUE if item.priority == 2 else "",
-        }.get(item.status or "pending", "")
 
     description = item.description.replace("\r", " ").replace("\n", " ")
-    line = f"{item.id:>3}. {symbol} {description}"
+    line = f"{'  ' * depth}{item.id:>3}. {symbol} {description}"
     if item.kind == "task" and item.priority > 1:
         line += f" p{item.priority}"
     if item.starred:
         line += f" {symbols['star']}"
+    marker = _due_marker(item, now)
+    if marker:
+        line += f" {marker}"
+    if item.tags:
+        line += " " + " ".join(f"#{tag}" for tag in item.tags)
     if show_boards:
         line += f"  [{symbols['sep'].join(item.boards)}]"
-    return _paint(line, code, color)
+    return _paint(line, _item_code(item, now), color)
 
 
 def _footer(stats: dict[str, int], symbols: dict[str, str]) -> str:
@@ -165,12 +187,18 @@ def _render_boards(
 ) -> None:
     if not boards:
         out.write("No items.\n\n")
+    now = _now()
     for index, (name, items) in enumerate(boards.items()):
         if index:
             out.write("\n")
         out.write(_paint(name, _BOLD_CYAN, color) + "\n")
-        for item in items:
-            out.write("  " + _format_item(item, symbols, color) + "\n")
+        ordered = sorted(items, key=_show_sort_key)
+        for item, depth in order_subtasks(ordered):
+            out.write(
+                "  "
+                + _format_item(item, symbols, color, depth=depth, now=now)
+                + "\n"
+            )
     if boards:
         out.write("\n")
     out.write(_paint(_footer(stats, symbols), _DIM, color) + "\n")
@@ -188,8 +216,20 @@ def _render_flat(
 ) -> None:
     out.write(_paint(title, _BOLD_CYAN, color) + "\n")
     if items:
-        for item in items:
-            out.write("  " + _format_item(item, symbols, color, show_boards=True) + "\n")
+        now = _now()
+        for item, depth in order_subtasks(items):
+            out.write(
+                "  "
+                + _format_item(
+                    item,
+                    symbols,
+                    color,
+                    show_boards=True,
+                    depth=depth,
+                    now=now,
+                )
+                + "\n"
+            )
     else:
         out.write(f"  {empty}\n")
     out.write("\n" + _paint(_footer(stats, symbols), _DIM, color) + "\n")
@@ -203,8 +243,19 @@ def _render_list(
     out: TextIO,
 ) -> None:
     if items:
-        for item in items:
-            out.write(_format_item(item, symbols, color, show_boards=True) + "\n")
+        now = _now()
+        for item, depth in order_subtasks(items):
+            out.write(
+                _format_item(
+                    item,
+                    symbols,
+                    color,
+                    show_boards=True,
+                    depth=depth,
+                    now=now,
+                )
+                + "\n"
+            )
     else:
         out.write("No items.\n")
     out.write("\n" + _paint(_footer(stats, symbols), _DIM, color) + "\n")
@@ -219,12 +270,24 @@ def _render_timeline(
 ) -> None:
     if not timeline:
         out.write("No items.\n")
+    now = _now()
     for index, (day, items) in enumerate(timeline.items()):
         if index:
             out.write("\n")
         out.write(_paint(day, _BOLD_CYAN, color) + "\n")
-        for item in items:
-            out.write("  " + _format_item(item, symbols, color, show_boards=True) + "\n")
+        for item, depth in order_subtasks(items):
+            out.write(
+                "  "
+                + _format_item(
+                    item,
+                    symbols,
+                    color,
+                    show_boards=True,
+                    depth=depth,
+                    now=now,
+                )
+                + "\n"
+            )
     if timeline:
         out.write("\n")
     out.write(_paint(_footer(stats, symbols), _DIM, color) + "\n")
@@ -244,9 +307,9 @@ class _PadView:
 
 
 def _now() -> datetime:
-    """Current time used to render item ages (patched in tests)."""
+    """Current local time used for dates and item ages (patched in tests)."""
 
-    return datetime.now(timezone.utc)
+    return dates.now()
 
 
 def _terminal_width() -> int:
@@ -347,8 +410,9 @@ def _pad_name(path: Path) -> str:
     return resolved.parent.name or resolved.name or str(path)
 
 
-def _show_sort_key(item: Item) -> tuple[int, int, int]:
-    return (_STATUS_RANK[item.status], -item.priority, item.id)
+def _show_sort_key(item: Item) -> tuple[Any, ...]:
+    has_due, due = dates.due_sort_key(item.due)
+    return (_STATUS_RANK[item.status], has_due, due, -item.priority, item.id)
 
 
 def _read_pad(path: Path, include_archived: bool) -> _PadView:
@@ -394,18 +458,8 @@ def _read_pad(path: Path, include_archived: bool) -> _PadView:
     )
 
 
-def _item_color_code(item: Item) -> str:
-    if item.kind == "note":
-        return _DIM
-    return {
-        "done": _GREEN,
-        "in_progress": _YELLOW,
-        "pending": (
-            _RED
-            if item.priority == 3
-            else _BLUE if item.priority == 2 else ""
-        ),
-    }.get(item.status or "pending", "")
+def _item_color_code(item: Item, now: datetime | None = None) -> str:
+    return _item_code(item, now)
 
 
 def _format_show_item(
@@ -414,6 +468,8 @@ def _format_show_item(
     color: bool,
     width: int,
     now: datetime,
+    *,
+    depth: int = 0,
 ) -> str:
     symbol = (
         symbols["note"]
@@ -426,13 +482,18 @@ def _format_show_item(
         extras.append(f"p{item.priority}")
     if item.starred:
         extras.append(symbols["star"])
+    marker = _due_marker(item, now)
+    if marker:
+        extras.append(marker)
+    if item.tags:
+        extras.append(" ".join(f"#{tag}" for tag in item.tags))
     extras.append(_format_age(item.created_at, now))
     kanban = item.links.get("kanban")
     if kanban:
         extras.append(f"kanban:{kanban}")
     if item.archived_at:
         extras.append("[archived]")
-    prefix = f"  {item.id:>3}. {symbol} "
+    prefix = f"{'  ' * (depth + 1)}{item.id:>3}. {symbol} "
     suffix = " " + " ".join(extras)
     available = width - len(prefix) - len(suffix)
     if available <= 0:
@@ -446,7 +507,7 @@ def _format_show_item(
                 description[: available - len(ellipsis)].rstrip() + ellipsis
             )
     return _paint(
-        prefix + description + suffix, _item_color_code(item), color
+        prefix + description + suffix, _item_color_code(item, now), color
     )
 
 
@@ -476,9 +537,16 @@ def _render_show(
             if board_index:
                 out.write("\n")
             out.write(_paint(board, _BOLD_CYAN, color) + "\n")
-            for item in items:
+            for item, depth in order_subtasks(items):
                 out.write(
-                    _format_show_item(item, symbols, color, width, moment)
+                    _format_show_item(
+                        item,
+                        symbols,
+                        color,
+                        width,
+                        moment,
+                        depth=depth,
+                    )
                     + "\n"
                 )
     out.write(
@@ -695,30 +763,116 @@ def _run_show_command(argv: Sequence[str], out: TextIO) -> int:
     return _run_show(args, out)
 
 
-def _parse_input(
-    values: Sequence[str], *, task: bool
-) -> tuple[str, list[str] | None, int]:
-    """Split ``@board`` and ``p:N`` tokens out of a new item's text."""
+_TIME_TOKEN = re.compile(r"^[0-9]{1,2}:[0-9]{2}$")
+_RELATIVE_TOKEN = {
+    "today",
+    "tomorrow",
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri",
+    "sat",
+    "sun",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
 
+
+def _tokenize(values: Sequence[str]) -> list[str]:
+    text = " ".join(values)
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _parse_input(
+    values: Sequence[str], *, task: bool, now: datetime | None = None
+) -> tuple[str, list[str] | None, int, dict[str, Any]]:
+    """Split taskbook-style tokens out of a new item's text.
+
+    Supports ``@board``, ``p:N``, ``due:WHEN``, ``remind:WHEN``,
+    ``every:REPEAT``, ``url:URL`` and ``#tag``.
+    """
+
+    tokens = _tokenize(values)
     boards: list[str] = []
+    tags: list[str] = []
     words: list[str] = []
     priority = 1
-    for token in " ".join(values).split():
+    extras: dict[str, Any] = {
+        "due": None,
+        "remind_at": None,
+        "repeat": None,
+        "url": None,
+        "tags": tags,
+    }
+    moment = now or _now()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].strip("\"'")
+        index += 1
         if token.startswith("@") and len(token) > 1:
             board = token[1:].strip(",;:")
             if board:
                 boards.append(board)
+                continue
+        if token.startswith("#") and len(token) > 1:
+            tag = token[1:].strip(",;:")
+            if tag:
+                tags.append(tag)
                 continue
         if task:
             match = _PRIORITY_TOKEN.match(token)
             if match:
                 priority = int(match.group(1))
                 continue
+        key, sep, value = token.partition(":")
+        if sep and key in ("due", "remind", "every", "url"):
+            if not value and index < len(tokens):
+                value = tokens[index].strip("\"'")
+                index += 1
+            if key in ("due", "remind") and index < len(tokens):
+                following = tokens[index].strip("\"'")
+                if (
+                    _TIME_TOKEN.match(following)
+                    and value.casefold() in _RELATIVE_TOKEN
+                ):
+                    value = f"{value} {following}"
+                    index += 1
+            if key == "every" and index < len(tokens):
+                following = tokens[index].strip("\"'").casefold()
+                if (
+                    value.isdigit()
+                    and following in ("day", "days", "week", "weeks")
+                ):
+                    value = f"{value} {following}"
+                    index += 1
+            try:
+                if key == "due":
+                    extras["due"] = dates.parse_due(value, now_=moment)
+                elif key == "remind":
+                    extras["remind_at"] = dates.parse_remind_at(
+                        value, now_=moment
+                    )
+                elif key == "every":
+                    extras["repeat"] = dates.parse_repeat_token(value)
+                else:
+                    extras["url"] = value or None
+            except ValueError as exc:
+                raise UserError(str(exc)) from exc
+            continue
         words.append(token)
     description = " ".join(words)
     if not description:
         raise UserError("description must not be empty")
-    return description, boards or None, priority
+    return description, boards or None, priority, extras
 
 
 def _parse_ids(values: Sequence[str]) -> list[int]:
@@ -804,6 +958,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--priority", nargs=2, metavar=("ID", "N"), help="set priority 1, 2 or 3")
     parser.add_argument("-r", "--restore", nargs="+", metavar="ID", help="restore archived items")
     parser.add_argument("-s", "--star", nargs="+", metavar="ID", help="toggle the star")
+    parser.add_argument("--notes", nargs="+", metavar="ID TEXT", help="replace an item's multi-line notes")
+    parser.add_argument("--url", nargs=2, metavar=("ID", "URL"), help="set or clear an item's URL")
+    parser.add_argument("--due", nargs=2, metavar=("ID", "WHEN"), help="set a due date (empty clears)")
+    parser.add_argument("--remind", nargs=2, metavar=("ID", "WHEN"), help="set a reminder datetime (empty clears)")
+    parser.add_argument("--repeat", nargs=2, metavar=("ID", "REPEAT"), help="set a repeat rule (none clears)")
+    parser.add_argument("--tags", nargs="+", metavar="ID TAG", help="replace an item's tags")
+    parser.add_argument("--sub", nargs="+", metavar="PARENT_ID DESCRIPTION", help="add a subtask")
+    parser.add_argument("--force", action="store_true", help="check a parent task even with open subtasks")
     parser.add_argument("--pad-dir", metavar="DIR", help="use this pad directory (default: $ORCHPAD_HOME or ~/.orchpad)")
     parser.add_argument("--where", action="store_true", help="print the pad directory")
     parser.add_argument("-t", "--task", nargs="+", metavar="DESCRIPTION", help="add a task")
@@ -837,6 +999,13 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
         "stats": args.stats,
         "task": args.task is not None,
         "timeline": args.timeline,
+        "notes": args.notes is not None,
+        "url": args.url is not None,
+        "due": args.due is not None,
+        "remind": args.remind is not None,
+        "repeat": args.repeat is not None,
+        "tags": args.tags is not None,
+        "sub": args.sub is not None,
     }
     chosen = [name for name, enabled in actions.items() if enabled]
     if len(chosen) > 1:
@@ -942,8 +1111,12 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
         return 0
 
     if action == "task":
-        description, boards, priority = _parse_input(args.task, task=True)
-        item = pad.add_task(description, boards=boards, priority=priority)
+        description, boards, priority, extras = _parse_input(
+            args.task, task=True
+        )
+        item = pad.add_task(
+            description, boards=boards, priority=priority, **extras
+        )
         if args.json:
             _write_json(out, {"item": item.to_dict()})
         else:
@@ -951,16 +1124,36 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
         return 0
 
     if action == "note":
-        description, boards, _ = _parse_input(args.note, task=False)
-        item = pad.add_note(description, boards=boards)
+        description, boards, _, extras = _parse_input(args.note, task=False)
+        item = pad.add_note(description, boards=boards, **extras)
         if args.json:
             _write_json(out, {"item": item.to_dict()})
         else:
             out.write(f"Added note {item.id}: {item.description}\n")
         return 0
 
+    if action == "sub":
+        parent = _parse_ids([args.sub[0]])[0]
+        description, boards, priority, extras = _parse_input(
+            args.sub[1:], task=True
+        )
+        item = pad.add_task(
+            description,
+            boards=boards,
+            priority=priority,
+            parent=parent,
+            **extras,
+        )
+        if args.json:
+            _write_json(out, {"item": item.to_dict()})
+        else:
+            out.write(
+                f"Added subtask {item.id} of {parent}: {item.description}\n"
+            )
+        return 0
+
     if action == "check":
-        items = pad.check(*_parse_ids(args.check))
+        items = pad.check(*_parse_ids(args.check), force=args.force)
         if args.json:
             _write_json(out, {"items": _item_dicts(items)})
         else:
@@ -1021,6 +1214,37 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
                 f"Set priority {priority} on {len(items)} "
                 f"item{'s' if len(items) != 1 else ''}.\n"
             )
+        return 0
+
+    if action in ("due", "remind", "repeat", "notes", "url", "tags"):
+        if action == "due":
+            item_id = _parse_ids([args.due[0]])[0]
+            item = pad.set_due(
+                item_id, dates.parse_due(args.due[1], now_=_now())
+            )
+        elif action == "remind":
+            item_id = _parse_ids([args.remind[0]])[0]
+            item = pad.set_remind_at(
+                item_id, dates.parse_remind_at(args.remind[1], now_=_now())
+            )
+        elif action == "repeat":
+            item_id = _parse_ids([args.repeat[0]])[0]
+            item = pad.set_repeat(
+                item_id, dates.parse_repeat_token(args.repeat[1])
+            )
+        elif action == "notes":
+            item_id = _parse_ids([args.notes[0]])[0]
+            item = pad.set_notes(item_id, " ".join(args.notes[1:]))
+        elif action == "url":
+            item_id = _parse_ids([args.url[0]])[0]
+            item = pad.set_url(item_id, args.url[1].strip() or None)
+        else:
+            item_id = _parse_ids([args.tags[0]])[0]
+            item = pad.set_tags(item_id, args.tags[1:])
+        if args.json:
+            _write_json(out, {"item": item.to_dict()})
+        else:
+            out.write(f"Updated item {item.id}.\n")
         return 0
 
     if action == "delete":

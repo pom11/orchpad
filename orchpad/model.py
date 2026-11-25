@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
+from .dates import normalize_repeat
+
 MAX_DESCRIPTION = 4000
+MAX_NOTES = 20000
 
 KINDS = ("task", "note")
 STATUSES = ("pending", "in_progress", "done")
@@ -71,6 +74,96 @@ def _validate_timestamp(value: Any, name: str, *, optional: bool = False) -> Non
         raise ValueError(f"{name} must be an ISO-8601 timestamp") from exc
 
 
+def validate_due(value: Any) -> str | None:
+    """Validate an optional ISO date or offset datetime."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("due must be an ISO date or datetime")
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            date.fromisoformat(text)
+        else:
+            datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("due must be an ISO date or datetime") from exc
+    return text
+
+
+def validate_remind_at(value: Any) -> str | None:
+    """Validate an optional reminder datetime."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("remind_at must be an ISO-8601 datetime")
+    try:
+        datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValueError("remind_at must be an ISO-8601 datetime") from exc
+    return value.strip()
+
+
+def validate_repeat(value: Any) -> str | None:
+    return normalize_repeat(value)
+
+
+def validate_notes(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("notes must be a string")
+    if not value.strip():
+        return None
+    if len(value) > MAX_NOTES:
+        raise ValueError(f"notes must be at most {MAX_NOTES} characters")
+    return value
+
+
+def validate_url(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("url must be a string")
+    text = value.strip()
+    return text or None
+
+
+def normalize_tags(tags: Any) -> list[str]:
+    """Validate a tag list, dropping ``#`` prefixes and duplicates."""
+
+    if tags is None:
+        return []
+    if isinstance(tags, str) or not isinstance(tags, (list, tuple)):
+        raise ValueError("tags must be a list of strings")
+    result: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError("tags must be strings")
+        value = tag.strip()
+        if value.startswith("#"):
+            value = value[1:]
+        if not value:
+            raise ValueError("tags must be non-empty strings")
+        if any(character.isspace() for character in value):
+            raise ValueError("tags must not contain whitespace")
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def validate_parent(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("parent must be a task id")
+    if value < 1:
+        raise ValueError("parent must be a positive task id")
+    return value
+
+
 @dataclass
 class Item:
     """One task or note on a pad."""
@@ -86,6 +179,14 @@ class Item:
     updated_at: str = field(default_factory=utcnow)
     links: dict[str, str] = field(default_factory=dict)
     archived_at: str | None = None
+    due: str | None = None
+    remind_at: str | None = None
+    repeat: str | None = None
+    notes: str | None = None
+    url: str | None = None
+    tags: list[str] = field(default_factory=list)
+    parent: int | None = None
+    completed_at: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.id, bool) or not isinstance(self.id, int):
@@ -123,6 +224,23 @@ class Item:
             links[key] = value
         self.links = links
         _validate_timestamp(self.archived_at, "archived_at", optional=True)
+        self.due = validate_due(self.due)
+        self.remind_at = validate_remind_at(self.remind_at)
+        self.repeat = validate_repeat(self.repeat)
+        self.notes = validate_notes(self.notes)
+        self.url = validate_url(self.url)
+        self.tags = normalize_tags(self.tags)
+        self.parent = validate_parent(self.parent)
+        if self.parent == self.id:
+            raise ValueError("an item cannot be its own parent")
+        _validate_timestamp(self.completed_at, "completed_at", optional=True)
+
+    def replace(self, **changes: Any) -> "Item":
+        """Return a validated copy with ``changes`` applied."""
+
+        data = self.to_dict()
+        data.update(changes)
+        return Item.from_dict(data)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation of the item."""
@@ -139,6 +257,14 @@ class Item:
             "updated_at": self.updated_at,
             "links": dict(self.links),
             "archived_at": self.archived_at,
+            "due": self.due,
+            "remind_at": self.remind_at,
+            "repeat": self.repeat,
+            "notes": self.notes,
+            "url": self.url,
+            "tags": list(self.tags),
+            "parent": self.parent,
+            "completed_at": self.completed_at,
         }
 
     @classmethod
@@ -159,4 +285,12 @@ class Item:
             updated_at=data.get("updated_at", utcnow()),
             links=dict(data.get("links") or {}),
             archived_at=data.get("archived_at"),
+            due=data.get("due"),
+            remind_at=data.get("remind_at"),
+            repeat=data.get("repeat"),
+            notes=data.get("notes"),
+            url=data.get("url"),
+            tags=data.get("tags"),
+            parent=data.get("parent"),
+            completed_at=data.get("completed_at"),
         )

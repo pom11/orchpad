@@ -2,12 +2,16 @@
 
 A pad directory holds two documents with the same schema::
 
-    {"version": 1, "next_id": N, "items": {"1": {...}, ...}}
+    {"version": 2, "next_id": N, "items": {"1": {...}, ...}}
 
 ``storage.json`` contains active items and ``archive.json`` contains
 deleted items.  Every read-modify-write runs under an ``fcntl.flock`` on
 ``<dir>/.lock`` and every write is staged in a temporary file in the same
 directory before being atomically moved into place with :func:`os.replace`.
+
+Schema version 1 files (no reminders-style fields) are read losslessly and
+rewritten as version 2 on the first write.  Unknown future versions are
+refused rather than silently truncated.
 """
 
 from __future__ import annotations
@@ -22,7 +26,8 @@ from typing import Any, Iterator
 
 from .model import Item
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_VERSIONS = frozenset({1, SCHEMA_VERSION})
 
 
 class StoreError(Exception):
@@ -36,7 +41,7 @@ def _empty_document() -> dict[str, Any]:
 def _validate_document(data: Any, path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise StoreError(f"{path}: expected a JSON object")
-    if data.get("version") != SCHEMA_VERSION:
+    if data.get("version") not in SUPPORTED_VERSIONS:
         raise StoreError(
             f"{path}: unsupported schema version {data.get('version')!r}"
         )
@@ -198,6 +203,18 @@ class Store:
             return self.read_active(), self.read_archive()
 
     def _write(self, path: Path, data: dict[str, Any]) -> None:
+        # A version 1 document is losslessly upgraded on its first write.
+        # Keys and values that were there survive; new optional fields get
+        # their defaults so the file is a complete version 2 document.
+        if data.get("version") == 1:
+            data = {
+                "version": SCHEMA_VERSION,
+                "next_id": data.get("next_id"),
+                "items": {
+                    key: Item.from_dict(raw).to_dict()
+                    for key, raw in data.get("items", {}).items()
+                },
+            }
         _validate_document(data, path)
         self.path.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(

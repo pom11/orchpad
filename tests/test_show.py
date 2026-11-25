@@ -30,6 +30,14 @@ def _item(
     created: str = "2026-11-25T11:00:00+00:00",
     links: dict[str, str] | None = None,
     archived_at: str | None = None,
+    due: str | None = None,
+    remind_at: str | None = None,
+    repeat: str | None = None,
+    notes: str | None = None,
+    url: str | None = None,
+    tags: list[str] | None = None,
+    parent: int | None = None,
+    completed_at: str | None = None,
 ) -> dict:
     if kind == "note":
         status = None
@@ -46,6 +54,14 @@ def _item(
         "updated_at": created,
         "links": dict(links or {}),
         "archived_at": archived_at,
+        "due": due,
+        "remind_at": remind_at,
+        "repeat": repeat,
+        "notes": notes,
+        "url": url,
+        "tags": list(tags or []),
+        "parent": parent,
+        "completed_at": completed_at,
     }
 
 
@@ -532,3 +548,56 @@ def test_show_subprocess_smoke(tmp_path):
     assert "smoke task" in result.stdout
     assert "of all tasks complete" in result.stdout
     assert "\x1b[" not in result.stdout
+
+
+def test_show_due_markers_sort_and_tags_with_no_color(tmp_path, capsys):
+    pad = _write_pad(
+        tmp_path / "alice" / "orchpad",
+        [
+            _item(1, "no due"),
+            _item(2, "due soon", due="2026-11-26", tags=["work"]),
+            _item(3, "late", due="2026-11-24"),
+        ],
+    )
+    code, out = _show(capsys, str(pad), "--color", "never")
+    assert code == 0
+    assert "\x1b[" not in out
+    lines = [
+        line for line in out.splitlines() if re.match(r"\s+\d+\.", line)
+    ]
+    assert [line.split(".", 1)[0].strip() for line in lines] == ["3", "2", "1"]
+    assert "overdue:2026-11-24" in out
+    assert "due:2026-11-26" in out
+    assert "#work" in out
+
+
+def test_show_overdue_is_red_when_colour_is_on(tmp_path, capsys):
+    pad = _write_pad(
+        tmp_path / "alice" / "orchpad",
+        [_item(1, "late", due="2026-11-24")],
+    )
+    code, out = _show(
+        capsys, str(pad), "--color", "always", env={"NO_COLOR": "1"}
+    )
+    assert code == 0
+    assert "\x1b[31m" in out
+    assert "overdue:2026-11-24" in out
+
+
+def test_show_indents_subtasks_under_their_parent(tmp_path, capsys):
+    pad = _write_pad(
+        tmp_path / "alice" / "orchpad",
+        [
+            _item(1, "parent task"),
+            _item(2, "child task", parent=1),
+        ],
+    )
+    code, out = _show(capsys, str(pad), "--color", "never")
+    assert code == 0
+    lines = out.splitlines()
+    parent_line = next(line for line in lines if "parent task" in line)
+    child_line = next(line for line in lines if "child task" in line)
+    assert lines.index(parent_line) < lines.index(child_line)
+    assert parent_line.startswith("    1.")
+    assert child_line.startswith("      2.")
+

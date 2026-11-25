@@ -270,6 +270,85 @@ def test_list_cache_expires_and_failures_leave_items_alone(tmp_path):
     assert missing.list()["items"][0]["status"] == "pending"
 
 
+def test_add_and_update_reminder_fields(tools, handlers):
+    parent = tools.add(description="parent")
+    added = json.loads(
+        handlers["orchpad_add"](
+            {
+                "description": "reminder",
+                "due": "2099-12-01",
+                "remind_at": "2099-11-30T09:00:00+01:00",
+                "repeat": "weekly",
+                "notes": "body",
+                "url": "https://example.invalid/x",
+                "tags": ["#work", "home"],
+                "parent": parent["id"],
+            }
+        )
+    )
+    assert added["ok"] is True
+    item = added["item"]
+    assert item["due"] == "2099-12-01"
+    assert item["remind_at"] == "2099-11-30T09:00:00+01:00"
+    assert item["repeat"] == "weekly"
+    assert item["notes"] == "body"
+    assert item["url"] == "https://example.invalid/x"
+    assert item["tags"] == ["work", "home"]
+    assert item["parent"] == parent["id"]
+
+    updated = json.loads(
+        handlers["orchpad_update"](
+            {
+                "id": item["id"],
+                "action": "due",
+                "value": "2099-12-02",
+                "tags": ["later"],
+                "notes": "changed",
+            }
+        )
+    )
+    assert updated["ok"] is True
+    assert updated["item"]["due"] == "2099-12-02"
+    assert updated["item"]["tags"] == ["later"]
+    assert updated["item"]["notes"] == "changed"
+
+
+def test_update_parent_force_and_clear(tools):
+    parent = tools.add(description="parent")
+    child = tools.add(description="child", parent=parent["id"])
+    with pytest.raises(ValueError):
+        tools.update(parent["id"], "check")
+    assert tools.update(parent["id"], "check", force=True)["status"] == "done"
+    assert tools.update(child["id"], "parent", None)["parent"] is None
+
+
+def test_list_new_filters(tools):
+    from datetime import date, timedelta
+
+    today = date.today().isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    tools.add(description="today", due=today, tags=["now"])
+    tools.add(description="tomorrow", due=tomorrow)
+    tools.add(description="unscheduled")
+
+    assert [
+        item["description"]
+        for item in tools.list(filters=["today"])["items"]
+    ] == ["today"]
+    assert [
+        item["description"]
+        for item in tools.list(filters=["upcoming"])["items"]
+    ] == ["tomorrow"]
+    assert {
+        item["description"]
+        for item in tools.list(filters=["#now"])["items"]
+    } == {"today"}
+    assert {
+        item["description"]
+        for item in tools.list(filters=["scheduled"])["items"]
+    } == {"today", "tomorrow"}
+
+
 def test_plugin_manifest_shape():
     manifest = (plugin_source() / "plugin.yaml").read_text()
     assert "name: orchpad" in manifest

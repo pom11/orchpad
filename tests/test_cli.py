@@ -486,3 +486,126 @@ def test_console_script_entry_points_declared():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'orchpad = "orchpad.cli:main"' in pyproject
     assert 'op = "orchpad.cli:main"' in pyproject
+
+
+def test_task_reminder_tokens_and_json_fields(env):
+    item = add_task_json(
+        env,
+        "pay rent",
+        "due:today",
+        "remind:+1h",
+        "every:month",
+        "#home",
+        "#money",
+    )
+    assert item["description"] == "pay rent"
+    assert item["due"] is not None
+    assert item["remind_at"] is not None
+    assert item["repeat"] == "monthly"
+    assert item["tags"] == ["home", "money"]
+    for key in (
+        "due",
+        "remind_at",
+        "repeat",
+        "notes",
+        "url",
+        "tags",
+        "parent",
+        "completed_at",
+    ):
+        assert key in item
+
+
+def test_quoted_due_token(env):
+    item = add_task_json(env, "call", 'due:"fri 17:00"')
+    assert item["description"] == "call"
+    assert "T17:00:00" in item["due"]
+
+
+def test_due_notes_url_tags_flags(env):
+    add_task(env, "field test")
+    result = run(env, "--due", "1", "2026-12-01", "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["item"]["due"] == "2026-12-01"
+
+    cleared = run(env, "--due", "1", "", "--json")
+    assert json.loads(cleared.stdout)["item"]["due"] is None
+
+    notes = run(env, "--notes", "1", "first line", "second line", "--json")
+    assert json.loads(notes.stdout)["item"]["notes"] == "first line second line"
+
+    url = run(env, "--url", "1", "https://example.invalid/x", "--json")
+    assert json.loads(url.stdout)["item"]["url"] == (
+        "https://example.invalid/x"
+    )
+    assert json.loads(run(env, "--url", "1", "", "--json").stdout)["item"][
+        "url"
+    ] is None
+
+    tags = run(env, "--tags", "1", "work", "urgent", "--json")
+    assert json.loads(tags.stdout)["item"]["tags"] == ["work", "urgent"]
+    assert json.loads(run(env, "--tags", "1", "--json").stdout)["item"][
+        "tags"
+    ] == []
+
+
+def test_subtask_flag_and_force_check(env):
+    add_task(env, "parent")
+    subtask = run(env, "--sub", "1", "child", "due:today", "--json")
+    assert subtask.returncode == 0, subtask.stderr
+    child = json.loads(subtask.stdout)["item"]
+    assert child["parent"] == 1
+    assert child["due"] is not None
+
+    refused = run(env, "-c", "1")
+    assert refused.returncode == 1
+    assert "--force" in refused.stderr
+    assert json.loads(run(env, "-l", "done", "--json").stdout)["items"] == []
+
+    forced = run(env, "-c", "1", "--force", "--json")
+    assert forced.returncode == 0, forced.stderr
+    assert json.loads(forced.stdout)["items"][0]["status"] == "done"
+
+
+def test_repeating_check_creates_next_occurrence(env):
+    add_task(env, "daily standup", "due:today", "every:day")
+    result = run(env, "-c", "1", "--json")
+    assert result.returncode == 0, result.stderr
+    items = json.loads(result.stdout)["items"]
+    assert len(items) == 2
+    done, occurrence = items
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+    assert occurrence["status"] == "pending"
+    assert occurrence["repeat"] == "daily"
+    assert occurrence["due"] != done["due"]
+    listed = json.loads(run(env, "-l", "--json").stdout)["items"]
+    assert {item["id"] for item in listed} == {done["id"], occurrence["id"]}
+
+
+def test_new_list_filters(env):
+    add_task(env, "today task", "due:today", "#now")
+    add_task(env, "tomorrow task", "due:tomorrow")
+    add_task(env, "yesterday task", "due:yesterday")
+    add_task(env, "unscheduled")
+
+    def descriptions(*filters):
+        payload = json.loads(run(env, "-l", *filters, "--json").stdout)
+        return [item["description"] for item in payload["items"]]
+
+    assert descriptions("today") == ["today task"]
+    assert descriptions("overdue") == ["yesterday task"]
+    assert descriptions("upcoming") == ["tomorrow task"]
+    assert sorted(descriptions("scheduled")) == [
+        "today task",
+        "tomorrow task",
+        "yesterday task",
+    ]
+    assert descriptions("#now") == ["today task"]
+
+
+def test_cli_help_lists_reminder_flags(env):
+    result = run(env, "--help")
+    assert result.returncode == 0
+    for flag in ("--due", "--notes", "--url", "--sub", "--force"):
+        assert flag in result.stdout
