@@ -242,6 +242,33 @@ Design inspired by [taskbook](https://github.com/klaudiosinani/taskbook) (MIT).
 
 ## Integrations
 
+### Apple Reminders sync
+
+On macOS, mapped boards can sync with Apple Reminders through `osascript`
+(JXA, no extra Python dependencies). It is opt-in and a dry run unless
+`--apply` is given:
+
+```sh
+op sync reminders --map work=Orchpad --json       # preview
+op sync reminders --map work=Orchpad --apply      # write
+op sync reminders --map work=Orchpad --save       # remember the mapping
+op sync reminders --map work=Orchpad --direction from-reminders --apply
+```
+
+Only lists named by `--map` (or saved in `<pad>/sync.json`) are ever read or
+written; other lists are untouched, and reminder lists themselves are never
+created or deleted. `--exclude-list NAME` and the comma-separated
+`ORCHPAD_SYNC_DENY` environment variable refuse a list even if it is mapped.
+`--direction` is `both` (default), `to-reminders` or `from-reminders`.
+
+The field mapping is description/title, notes/body, due/dueDate,
+remind_at/remindMeDate, priority (1/2/3 = none/medium/high),
+starred/flagged, done/completed_at/completed/completionDate, and `url` is
+appended to the reminder body. Repeat rules and subtasks stay orchpad-only
+because JXA does not expose them. Sync state lives in
+`<pad>/sync-reminders.json`; the newer side wins a conflict, and deletions
+propagate only for pairs created by an earlier sync (never on a first sync).
+
 ### Hermes plugin
 
 Every Hermes profile keeps its own pad at `<profile home>/orchpad/`. The
