@@ -133,3 +133,50 @@ def test_lock_creates_pad_directory(tmp_path):
     with store.lock():
         pass
     assert (tmp_path / "pad" / ".lock").exists()
+
+
+def _crash_on_second_write(monkeypatch):
+    from orchpad import store as store_mod
+    real = store_mod.Store._write
+    calls = {"n": 0}
+
+    def flaky(self, path, data):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("simulated crash between the two writes")
+        return real(self, path, data)
+
+    monkeypatch.setattr(store_mod.Store, "_write", flaky)
+
+
+def _present(tmp_path, item_id):
+    from orchpad.pad import Pad
+    active, archive = Pad(tmp_path).store.snapshot()
+    return str(item_id) in active["items"] or str(item_id) in archive["items"]
+
+
+def test_crash_mid_delete_keeps_the_item_somewhere(tmp_path, monkeypatch):
+    from orchpad.pad import Pad
+    pad = Pad(tmp_path)
+    item = pad.add_task("keep me")
+    _crash_on_second_write(monkeypatch)
+    try:
+        pad.delete(item.id)
+    except OSError:
+        pass
+    monkeypatch.undo()
+    assert _present(tmp_path, item.id)
+
+
+def test_crash_mid_restore_keeps_the_item_somewhere(tmp_path, monkeypatch):
+    from orchpad.pad import Pad
+    pad = Pad(tmp_path)
+    item = pad.add_task("keep me")
+    pad.delete(item.id)
+    _crash_on_second_write(monkeypatch)
+    try:
+        pad.restore(item.id)
+    except OSError:
+        pass
+    monkeypatch.undo()
+    assert _present(tmp_path, item.id)

@@ -72,18 +72,28 @@ class Transaction:
         self._active: dict[str, Any] | None = None
         self._archive: dict[str, Any] | None = None
         self._dirty: set[str] = set()
+        self._loaded_ids: dict[str, set[str]] = {}
 
     @property
     def active(self) -> dict[str, Any]:
         if self._active is None:
             self._active = self._store.read_active()
+            self._loaded_ids["active"] = set(self._active["items"])
         return self._active
 
     @property
     def archive(self) -> dict[str, Any]:
         if self._archive is None:
             self._archive = self._store.read_archive()
+            self._loaded_ids["archive"] = set(self._archive["items"])
         return self._archive
+
+    def gained(self, document: str) -> bool:
+        """Whether ``document`` now holds an item id it did not hold on load."""
+        data = self._active if document == "active" else self._archive
+        if data is None:
+            return False
+        return bool(set(data["items"]) - self._loaded_ids.get(document, set()))
 
     def mark_active(self) -> None:
         self._dirty.add("active")
@@ -168,13 +178,18 @@ class Store:
         with self.lock():
             transaction = Transaction(self)
             yield transaction
-            # Archive first: a crash between the two writes then leaves a
-            # deleted item in both documents (recoverable) instead of in
-            # neither (lost).
-            if "archive" in transaction.dirty:
-                self._write(self.archive_path, transaction.archive)
-            if "active" in transaction.dirty:
-                self._write(self.active_path, transaction.active)
+            # Write the document that GAINED items first: a crash between the
+            # two writes then leaves a moved item in both documents
+            # (recoverable) instead of in neither (lost). Delete moves
+            # active -> archive, restore moves archive -> active.
+            order = ["active", "archive"]
+            if transaction.gained("archive"):
+                order.reverse()
+            for name in order:
+                if name in transaction.dirty:
+                    path = (self.active_path if name == "active"
+                            else self.archive_path)
+                    self._write(path, getattr(transaction, name))
 
     def snapshot(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return a consistent ``(active, archive)`` snapshot."""
