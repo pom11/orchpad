@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -111,6 +112,48 @@ class FakeBackend:
             for reminder in self.lists[list_name]
             if reminder.id != reminder_id
         ]
+
+
+LOCAL_TZ = timezone(timedelta(hours=2))
+
+
+def _jxa_local(value, zone):
+    """Spell a stored date the way JXA's ``localIso`` does: wall clock + offset."""
+
+    if value is None:
+        return None
+    moment = datetime.fromisoformat(value.strip())
+    if moment.tzinfo is None:
+        # Reminders' dictionary parses date-only and naive values as local.
+        moment = moment.replace(tzinfo=zone)
+    return moment.astimezone(zone).replace(microsecond=0).isoformat()
+
+
+class LocalBackend(FakeBackend):
+    """Fake backend that stores dates like Apple Reminders/JXA.
+
+    A date-only value is local midnight, and every stored date reads back as
+    local wall-clock time with an offset.  That is exactly the behaviour that
+    makes UTC midnight (02:00 in this zone) distinguishable from a date.
+    """
+
+    def __init__(self, lists=None, zone=LOCAL_TZ):
+        self.zone = zone
+        super().__init__(lists)
+
+    def _stored(self, reminder):
+        return replace(
+            reminder,
+            due=_jxa_local(reminder.due, self.zone),
+            remind=_jxa_local(reminder.remind, self.zone),
+            completed_at=_jxa_local(reminder.completed_at, self.zone),
+        )
+
+    def create(self, list_name, reminder):
+        return super().create(list_name, self._stored(reminder))
+
+    def update(self, reminder):
+        return super().update(self._stored(reminder))
 
 
 @pytest.fixture()
@@ -495,6 +538,113 @@ def test_priority_and_flag_mapping_from_reminder(pad):
     item = pad.list()[0]
     assert item.priority == 2  # medium
     assert item.starred is True
+
+
+# ---------------------------------------------------------------------------
+# Dates around midnight in non-UTC zones
+
+
+def test_date_only_round_trip_is_stable_in_a_utc_plus_two_zone(pad, monkeypatch):
+    monkeypatch.setattr(sync_reminders, "_local_timezone", lambda: LOCAL_TZ)
+    pad.add_task("dated", ["Work"], due="2026-12-01")
+    backend = LocalBackend({"Orchpad": []})
+
+    assert sync(pad, backend, apply=True)["failures"] == []
+    live = backend.by_title("Orchpad")["dated"]
+    # A date-only due is local midnight, not UTC midnight.
+    assert live.due == "2026-12-01T00:00:00+02:00"
+    assert pad.list()[0].due == "2026-12-01"
+
+    # Editing the pad and pushing again must not move the date.
+    pad.edit_fields(pad.list()[0].id, description="dated again")
+    assert sync(pad, backend, apply=True)["failures"] == []
+    live = backend.by_title("Orchpad")["dated again"]
+    assert live.due == "2026-12-01T00:00:00+02:00"
+    assert sync(pad, backend)["actions"] == []
+    assert sync(pad, backend, apply=True)["actions"] == []
+
+
+def test_local_midnight_reminder_keeps_its_date_when_pushed_back(
+    pad, monkeypatch
+):
+    monkeypatch.setattr(sync_reminders, "_local_timezone", lambda: LOCAL_TZ)
+    backend = LocalBackend(
+        {
+            "Orchpad": [
+                Reminder(
+                    "remote-1",
+                    "Orchpad",
+                    "local midnight",
+                    due="2026-12-03T00:00:00+02:00",
+                    remind="2026-12-03T00:00:00+02:00",
+                )
+            ]
+        }
+    )
+
+    sync(pad, backend, apply=True)
+    item = pad.list()[0]
+    assert item.due == "2026-12-03"
+    assert item.remind_at == "2026-12-03T00:00:00+02:00"
+
+    # A later pad edit pushes the reminder value back as local midnight.
+    pad.edit_fields(item.id, description="local midnight edited")
+    sync(pad, backend, apply=True)
+    live = backend.by_title("Orchpad")["local midnight edited"]
+    assert live.due == "2026-12-03T00:00:00+02:00"
+    assert live.remind == "2026-12-03T00:00:00+02:00"
+    assert sync(pad, backend)["actions"] == []
+
+
+def test_pulled_utc_midnight_reminder_converges_after_one_run(
+    pad, monkeypatch
+):
+    monkeypatch.setattr(sync_reminders, "_local_timezone", lambda: LOCAL_TZ)
+    backend = LocalBackend(
+        {
+            "Orchpad": [
+                Reminder(
+                    "remote-1",
+                    "Orchpad",
+                    "utc midnight",
+                    due="2026-11-30T02:00:00+02:00",
+                    remind="2026-11-30T02:00:00+02:00",
+                )
+            ]
+        }
+    )
+
+    assert sync(pad, backend, apply=True)["failures"] == []
+    item = pad.list()[0]
+    # UTC midnight is a real time, not a date, in this zone.
+    assert item.due == "2026-11-30T00:00:00+00:00"
+    assert item.remind_at == "2026-11-30T00:00:00+00:00"
+
+    assert sync(pad, backend)["actions"] == []
+    assert sync(pad, backend, apply=True)["actions"] == []
+
+
+def test_update_item_stores_the_live_reminder_fingerprint(pad, monkeypatch):
+    monkeypatch.setattr(sync_reminders, "_local_timezone", lambda: LOCAL_TZ)
+    pad.add_task("task", ["Work"], due="2026-11-30")
+    backend = LocalBackend({"Orchpad": []})
+    sync(pad, backend, apply=True)
+
+    live = backend.by_title("Orchpad")["task"]
+    assert live.due == "2026-11-30T00:00:00+02:00"
+    # Reminders now reports the due instant at UTC midnight.  An item pull
+    # cannot represent that as a date, so the pair has to keep the live
+    # reminder's own fingerprint or every later run repeats this update.
+    backend.touch("Orchpad", live.id, due="2026-11-30T02:00:00+02:00")
+
+    plan = sync(pad, backend)
+    assert [action["action"] for action in plan["actions"]] == ["update-item"]
+    assert sync(pad, backend, apply=True)["failures"] == []
+    assert state_pairs(pad)[0]["reminder_fingerprint"]["due"] == (
+        "2026-11-30T00:00:00Z"
+    )
+    assert sync(pad, backend)["actions"] == []
+    assert sync(pad, backend, apply=True)["actions"] == []
 
 
 # ---------------------------------------------------------------------------

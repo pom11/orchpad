@@ -533,7 +533,14 @@ def _remind_for_item(value: str | None) -> str | None:
     if canonical is None:
         return None
     if len(canonical) == 10:
-        return f"{canonical}T00:00:00+00:00"
+        # A date-only reminder means "that day" in Reminders, so spell it as
+        # midnight in the machine's own zone.  UTC midnight would read back
+        # as 02:00 in Europe/+02:00 and never fold back into a date.
+        return (
+            datetime.fromisoformat(f"{canonical}T00:00:00")
+            .replace(tzinfo=_local_timezone())
+            .isoformat()
+        )
     return _offset_text(canonical)
 
 
@@ -824,6 +831,8 @@ class Change:
     reminder_id: str | None = None
     desired: Reminder | None = None
     item_changes: dict[str, Any] | None = None
+    #: The live reminder this change was planned from, for item-side writes.
+    observed: Reminder | None = None
 
     @property
     def side(self) -> str:
@@ -923,6 +932,7 @@ def _item_action(
         item_id=item.id,
         reminder_id=reminder.id,
         item_changes=item_changes_from_reminder(reminder),
+        observed=reminder,
     )
 
 
@@ -935,6 +945,7 @@ def _create_item_action(board: str, list_name: str, reminder: Reminder) -> Chang
         reason="new reminder in a mapped list",
         reminder_id=reminder.id,
         item_changes=item_changes_from_reminder(reminder),
+        observed=reminder,
     )
 
 
@@ -1144,8 +1155,7 @@ def _read_item(pad: Pad, item_id: int) -> Item | None:
     return Item.from_dict(raw) if raw is not None else None
 
 
-def _create_item(pad: Pad, board: str, reminder: Reminder) -> Item:
-    changes = item_changes_from_reminder(reminder)
+def _create_item(pad: Pad, board: str, changes: Mapping[str, Any]) -> Item:
     stamp = utcnow()
     with pad.store.transaction() as transaction:
         item_id = transaction.active["next_id"]
@@ -1269,23 +1279,25 @@ def _apply_change(
 
     if action == "create-item":
         assert change.item_changes is not None
-        reminder = Reminder(
-            id=change.reminder_id or "",
-            list_name=change.list_name,
-            title=change.title,
-            body=encode_body(
-                change.item_changes["notes"], change.item_changes["url"]
-            ),
-            due=change.item_changes["due"],
-            remind=change.item_changes["remind_at"],
-            priority=PRIORITY_TO_REMINDERS[
-                change.item_changes["priority"]
-            ],
-            flagged=change.item_changes["starred"],
-            completed=change.item_changes["completed"],
-            completed_at=change.item_changes["completed_at"],
-        )
-        item = _create_item(pad, change.board, reminder)
+        item = _create_item(pad, change.board, change.item_changes)
+        reminder = change.observed
+        if reminder is None:
+            reminder = Reminder(
+                id=change.reminder_id or "",
+                list_name=change.list_name,
+                title=change.title,
+                body=encode_body(
+                    change.item_changes["notes"], change.item_changes["url"]
+                ),
+                due=change.item_changes["due"],
+                remind=change.item_changes["remind_at"],
+                priority=PRIORITY_TO_REMINDERS[
+                    change.item_changes["priority"]
+                ],
+                flagged=change.item_changes["starred"],
+                completed=change.item_changes["completed"],
+                completed_at=change.item_changes["completed_at"],
+            )
         state.put(_pair_for(change.board, change.list_name, item, reminder))
         return
 
@@ -1297,24 +1309,28 @@ def _apply_change(
             )
         assert change.item_changes is not None
         item = _write_item_from_reminder(pad, item, change.item_changes)
-        # The reminder object itself is not carried on item-side changes;
-        # synthesise it from the stored fingerprint-shaped fields.
-        reminder = Reminder(
-            id=change.reminder_id or "",
-            list_name=change.list_name,
-            title=change.title,
-            body=encode_body(
-                change.item_changes["notes"], change.item_changes["url"]
-            ),
-            due=change.item_changes["due"],
-            remind=change.item_changes["remind_at"],
-            priority=PRIORITY_TO_REMINDERS[
-                change.item_changes["priority"]
-            ],
-            flagged=change.item_changes["starred"],
-            completed=change.item_changes["completed"],
-            completed_at=change.item_changes["completed_at"],
-        )
+        # The pair must remember the reminder as Reminders actually stores
+        # it.  Deriving the reminder fingerprint from the item loses
+        # distinctions (a UTC midnight that displays as 02:00 local, for
+        # example) and makes every later run re-plan the same update.
+        reminder = change.observed
+        if reminder is None:
+            reminder = Reminder(
+                id=change.reminder_id or "",
+                list_name=change.list_name,
+                title=change.title,
+                body=encode_body(
+                    change.item_changes["notes"], change.item_changes["url"]
+                ),
+                due=change.item_changes["due"],
+                remind=change.item_changes["remind_at"],
+                priority=PRIORITY_TO_REMINDERS[
+                    change.item_changes["priority"]
+                ],
+                flagged=change.item_changes["starred"],
+                completed=change.item_changes["completed"],
+                completed_at=change.item_changes["completed_at"],
+            )
         state.put(_pair_for(change.board, change.list_name, item, reminder))
         return
 
