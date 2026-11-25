@@ -23,6 +23,10 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+orchpad = "orchpad.cli:main"
+op = "orchpad.cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 

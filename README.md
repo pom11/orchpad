@@ -57,6 +57,53 @@ Every id is unique per pad and is never reused, including after deletion and
 restore. Unknown ids raise `KeyError`. `delete` and `clear` write to
 `archive.json`; `restore` moves items back to `storage.json`.
 
+## Command line
+
+Installing the package puts two equivalent console scripts on `PATH`,
+`orchpad` and `op`. `python -m orchpad` works without installing the scripts.
+Pads live in `$ORCHPAD_HOME` or `~/.orchpad`; `--pad-dir DIR` picks another pad and `--where` prints the location
+in use.
+
+```sh
+op                              # board view
+op -t "write release notes @work p:3"
+op -n "remember to tag the release @work"
+op -c 1                         # toggle done
+op -b 1                         # toggle in progress
+op -s 1                         # toggle the star
+op -p 1 3                       # set priority 1, 2 or 3
+op -e 1 "new description"
+op -m 1 work home               # replace the item's boards
+op -f release                   # case-insensitive search
+op -l done                      # filter by status, kind, starred, archived or board
+op -i                           # timeline grouped by creation date
+op --stats
+op -d 1                         # archive
+op -a                           # show the archive
+op -r 1                         # restore from the archive
+op --clear                      # archive every done task
+```
+
+New tasks and notes accept `@board` tokens anywhere in the description to
+select boards, and tasks accept `p:2` or `p:3` to set priority; those tokens
+are removed from the stored description. Commands take comma-separated ids
+(`op -c 1,2`) and a leading `@` is optional (`op -c @1`).
+
+Every read view supports `--json` for machine use: the board view, `--archive`,
+`--list`, `--find`, `--timeline`, `--stats` and `--where`. Writes also accept
+`--json` and return the affected items. Read views end with a footer such as:
+
+```
+50% of all tasks complete · 1 done · 0 in progress · 1 pending · 2 notes
+```
+
+ANSI colour is used only on an interactive terminal; piped output is plain and
+`NO_COLOR` disables colour. Terminals whose encoding cannot represent the
+symbols get an ASCII fallback (`[ ]`, `[x]`, `[~]`, `*`).
+
+Exit codes: `0` success, `1` user error (unknown id, empty description, bad
+flag), `2` store error (unreadable or corrupt pad files).
+
 ## Python API
 
 | Method | Purpose |
