@@ -12,8 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # One macOS leg (fcntl/flock behaviour); the account's macOS runners
+          # are shared and scarce, so the full version matrix runs on Linux.
+          - os: macos-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
