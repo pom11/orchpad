@@ -331,7 +331,7 @@ def test_archive_schema_and_next_id(pad):
     item = pad.add_task("archived")
     pad.delete(item.id)
     raw = json.loads((pad.path / "archive.json").read_text())
-    assert raw["version"] == 1
+    assert raw["version"] == 2
     assert raw["next_id"] == 2
     assert raw["items"]["1"]["archived_at"] is not None
     active = json.loads((pad.path / "storage.json").read_text())

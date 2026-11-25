@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from . import dates
 from .model import (
     DEFAULT_BOARD,
     KINDS,
@@ -18,7 +19,27 @@ from .model import (
 )
 from .store import Store, StoreError, Transaction
 
-LIST_FILTERS = frozenset(STATUSES) | frozenset(KINDS) | {"starred", "archived"}
+LIST_FILTERS = frozenset(STATUSES) | frozenset(KINDS) | {
+    "starred",
+    "archived",
+    "today",
+    "overdue",
+    "upcoming",
+    "scheduled",
+}
+
+ITEM_FIELDS = frozenset(
+    {
+        "description",
+        "due",
+        "remind_at",
+        "repeat",
+        "notes",
+        "url",
+        "tags",
+        "parent",
+    }
+)
 
 
 def _default_path() -> Path:
@@ -32,15 +53,64 @@ def _sort_items(items: Iterable[Item]) -> list[Item]:
     return sorted(items, key=lambda item: (-item.priority, item.id))
 
 
+def order_subtasks(items: Iterable[Item]) -> list[tuple[Item, int]]:
+    """Order items with each subtask directly under its parent.
+
+    The depth starts at zero for top-level items.  An item whose parent is
+    not in the given group is treated as top-level there.
+    """
+
+    ordered = list(items)
+    by_id = {item.id: item for item in ordered}
+    children: dict[int, list[Item]] = {}
+    roots: list[Item] = []
+    for item in ordered:
+        if (
+            item.parent is not None
+            and item.parent in by_id
+            and item.parent != item.id
+        ):
+            children.setdefault(item.parent, []).append(item)
+        else:
+            roots.append(item)
+
+    result: list[tuple[Item, int]] = []
+
+    def walk(item: Item, depth: int, seen: set[int]) -> None:
+        if item.id in seen:
+            return
+        seen.add(item.id)
+        result.append((item, depth))
+        for child in children.get(item.id, []):
+            walk(child, depth + 1, seen)
+
+    seen: set[int] = set()
+    for root in roots:
+        walk(root, 0, seen)
+    for item in ordered:  # cycle safety: never drop an item from a view
+        if item.id not in seen:
+            walk(item, 0, seen)
+    return result
+
+
 class Pad:
     """A task and notes pad backed by a directory of JSON documents.
 
     ``path`` defaults to ``$ORCHPAD_HOME`` or ``~/.orchpad``.
     """
 
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        clock: Callable[[], Any] | None = None,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else _default_path()
         self.store = Store(self.path)
+        self._clock = clock or dates.now
+
+    def _now(self) -> Any:
+        return dates.coerce_now(self._clock())
 
     # -- internal helpers -------------------------------------------------
 
@@ -118,10 +188,28 @@ class Pad:
         boards: Sequence[str] | None,
         priority: int,
         status: str | None,
+        *,
+        due: str | None = None,
+        remind_at: str | None = None,
+        repeat: str | None = None,
+        notes: str | None = None,
+        url: str | None = None,
+        tags: Sequence[str] | None = None,
+        parent: int | None = None,
     ) -> Item:
         description = validate_description(description)
-        board_list = normalize_boards(boards)
         with self.store.transaction() as transaction:
+            items = self._load_active(transaction)
+            if parent is not None:
+                if parent not in items:
+                    raise KeyError(parent)
+                if items[parent].kind != "task":
+                    raise ValueError(f"item {parent} is a note, not a task")
+                # Subtasks live on their parent's boards unless the new
+                # item names boards of its own.
+                if boards is None:
+                    boards = items[parent].boards
+            board_list = normalize_boards(boards)
             item_id = transaction.active["next_id"]
             stamp = utcnow()
             item = Item(
@@ -133,6 +221,13 @@ class Pad:
                 status=status,
                 created_at=stamp,
                 updated_at=stamp,
+                due=due,
+                remind_at=remind_at,
+                repeat=repeat,
+                notes=notes,
+                url=url,
+                tags=list(tags or []),
+                parent=parent,
             )
             transaction.active["next_id"] = item_id + 1
             transaction.active["items"][str(item_id)] = item.to_dict()
@@ -144,29 +239,145 @@ class Pad:
         desc: str,
         boards: Sequence[str] | None = None,
         priority: int = 1,
+        *,
+        due: str | None = None,
+        remind_at: str | None = None,
+        repeat: str | None = None,
+        notes: str | None = None,
+        url: str | None = None,
+        tags: Sequence[str] | None = None,
+        parent: int | None = None,
     ) -> Item:
         """Add a pending task and return it."""
 
-        return self._add("task", desc, boards, priority, "pending")
+        return self._add(
+            "task",
+            desc,
+            boards,
+            priority,
+            "pending",
+            due=due,
+            remind_at=remind_at,
+            repeat=repeat,
+            notes=notes,
+            url=url,
+            tags=tags,
+            parent=parent,
+        )
 
     def add_note(
-        self, desc: str, boards: Sequence[str] | None = None
+        self,
+        desc: str,
+        boards: Sequence[str] | None = None,
+        *,
+        due: str | None = None,
+        remind_at: str | None = None,
+        repeat: str | None = None,
+        notes: str | None = None,
+        url: str | None = None,
+        tags: Sequence[str] | None = None,
+        parent: int | None = None,
     ) -> Item:
         """Add a note and return it."""
 
-        return self._add("note", desc, boards, 1, None)
+        return self._add(
+            "note",
+            desc,
+            boards,
+            1,
+            None,
+            due=due,
+            remind_at=remind_at,
+            repeat=repeat,
+            notes=notes,
+            url=url,
+            tags=tags,
+            parent=parent,
+        )
 
     # -- task state -------------------------------------------------------
 
-    def check(self, *ids: int) -> list[Item]:
-        """Toggle ``done`` for each task id."""
+    def check(self, *ids: int, force: bool = False) -> list[Item]:
+        """Toggle ``done`` for each task id.
 
-        def change(item: Item) -> None:
-            if item.kind != "task":
-                raise ValueError(f"item {item.id} is a note, not a task")
-            item.status = "pending" if item.status == "done" else "done"
+        A parent with open subtasks needs ``force=True``.  Checking a
+        repeating task keeps the done item and appends a fresh pending
+        occurrence with its due and reminder advanced.
+        """
 
-        return self._update(ids, change)
+        with self.store.transaction() as transaction:
+            items = self._load_active(transaction)
+            affected = self._resolve(items, ids)
+            stamp = utcnow()
+            moment = self._now()
+            for item in affected:
+                if item.kind != "task":
+                    raise ValueError(f"item {item.id} is a note, not a task")
+                if item.status == "done":
+                    continue
+                open_subtasks = [
+                    child
+                    for child in items.values()
+                    if child.parent == item.id and child.status != "done"
+                ]
+                if open_subtasks and not force:
+                    raise ValueError(
+                        f"item {item.id} has open subtasks "
+                        f"({', '.join(str(child.id) for child in open_subtasks)}); "
+                        "use --force to check it anyway"
+                    )
+
+            results: list[Item] = []
+            occurrences: list[Item] = []
+            for item in affected:
+                if item.status == "done":
+                    item.status = "pending"
+                    item.completed_at = None
+                else:
+                    item.status = "done"
+                    item.completed_at = stamp
+                    if item.repeat:
+                        occurrences.append(
+                            self._next_occurrence(transaction, item, stamp, moment)
+                        )
+                item.updated_at = stamp
+                transaction.active["items"][str(item.id)] = item.to_dict()
+                results.append(item)
+            transaction.mark_active()
+        return [*results, *occurrences]
+
+    def _next_occurrence(
+        self,
+        transaction: Transaction,
+        item: Item,
+        stamp: str,
+        moment: Any,
+    ) -> Item:
+        """Create the next pending copy of a repeating task."""
+
+        item_id = transaction.active["next_id"]
+        occurrence = Item(
+            id=item_id,
+            kind="task",
+            description=item.description,
+            boards=list(item.boards),
+            priority=item.priority,
+            starred=False,
+            status="pending",
+            created_at=stamp,
+            updated_at=stamp,
+            links=dict(item.links),
+            due=dates.advance(item.due, item.repeat, now_=moment),
+            remind_at=dates.advance(item.remind_at, item.repeat, now_=moment),
+            repeat=item.repeat,
+            notes=item.notes,
+            url=item.url,
+            tags=list(item.tags),
+            parent=item.parent,
+        )
+        transaction.active["next_id"] = item_id + 1
+        transaction.active["items"][str(item_id)] = occurrence.to_dict()
+        return occurrence
 
     def begin(self, *ids: int) -> list[Item]:
         """Toggle ``in_progress`` for each task id."""
@@ -177,6 +388,8 @@ class Pad:
             item.status = (
                 "pending" if item.status == "in_progress" else "in_progress"
             )
+            if item.status != "done":
+                item.completed_at = None
 
         return self._update(ids, change)
 
@@ -235,6 +448,57 @@ class Pad:
             item.links[key] = value
 
         return self._update([id], change)[0]
+
+    def edit_fields(self, id: int, **fields: Any) -> Item:
+        """Set reminders-style fields on an item; ``None`` clears a field."""
+
+        unknown = set(fields) - ITEM_FIELDS
+        if unknown:
+            raise ValueError(
+                "unknown fields: " + ", ".join(sorted(unknown))
+            )
+
+        with self.store.transaction() as transaction:
+            items = self._load_active(transaction)
+            item = self._resolve(items, [id])[0]
+            if "description" in fields:
+                fields["description"] = validate_description(fields["description"])
+            parent = fields.get("parent")
+            if parent is not None:
+                if parent not in items:
+                    raise KeyError(parent)
+                if parent == id:
+                    raise ValueError("an item cannot be its own parent")
+                if items[parent].kind != "task":
+                    raise ValueError(f"item {parent} is a note, not a task")
+            rebuilt = item.replace(**fields)
+            for key, value in rebuilt.to_dict().items():
+                setattr(item, key, value)
+            item.updated_at = utcnow()
+            transaction.active["items"][str(item.id)] = item.to_dict()
+            transaction.mark_active()
+        return item
+
+    def set_due(self, id: int, due: str | None) -> Item:
+        return self.edit_fields(id, due=due)
+
+    def set_remind_at(self, id: int, remind_at: str | None) -> Item:
+        return self.edit_fields(id, remind_at=remind_at)
+
+    def set_repeat(self, id: int, repeat: str | None) -> Item:
+        return self.edit_fields(id, repeat=repeat)
+
+    def set_notes(self, id: int, notes: str | None) -> Item:
+        return self.edit_fields(id, notes=notes)
+
+    def set_url(self, id: int, url: str | None) -> Item:
+        return self.edit_fields(id, url=url)
+
+    def set_tags(self, id: int, tags: Sequence[str]) -> Item:
+        return self.edit_fields(id, tags=list(tags))
+
+    def set_parent(self, id: int, parent: int | None) -> Item:
+        return self.edit_fields(id, parent=parent)
 
     # -- archive ----------------------------------------------------------
 
@@ -298,8 +562,10 @@ class Pad:
         """List items filtered by status, kind, star, archive or board.
 
         All given filters must match.  ``archived`` selects archived items
-        instead of active ones; any other unknown value is treated as a
-        board name.
+        instead of active ones; ``today``, ``overdue``, ``upcoming`` and
+        ``scheduled`` filter by due date and show open tasks only unless
+        combined with ``done``; ``#tag`` filters by tag; any other unknown
+        value is treated as a board name.
         """
 
         filters: list[str] = []
@@ -313,6 +579,17 @@ class Pad:
             if "archived" in filters
             else self._active_items()
         )
+        moment = self._now()
+        date_views = {"today", "overdue", "upcoming", "scheduled"}
+        if (
+            any(attr in date_views for attr in filters)
+            and "done" not in filters
+        ):
+            items = [
+                item
+                for item in items
+                if item.status in ("pending", "in_progress")
+            ]
         for attr in filters:
             if attr in STATUSES:
                 items = [item for item in items if item.status == attr]
@@ -322,6 +599,29 @@ class Pad:
                 items = [item for item in items if item.starred]
             elif attr == "archived":
                 continue
+            elif attr == "scheduled":
+                items = [item for item in items if item.due is not None]
+            elif attr == "today":
+                items = [
+                    item
+                    for item in items
+                    if dates.due_date(item.due, now_=moment) == moment.date()
+                ]
+            elif attr == "overdue":
+                items = [
+                    item
+                    for item in items
+                    if dates.due_state(item.due, now_=moment) == "overdue"
+                ]
+            elif attr == "upcoming":
+                items = [
+                    item
+                    for item in items
+                    if dates.due_state(item.due, now_=moment) == "upcoming"
+                ]
+            elif attr.startswith("#") and len(attr) > 1:
+                tag = attr[1:]
+                items = [item for item in items if tag in item.tags]
             else:
                 items = [item for item in items if attr in item.boards]
         return _sort_items(items)

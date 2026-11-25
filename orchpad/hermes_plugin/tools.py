@@ -18,10 +18,43 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from orchpad import Pad
+from orchpad import Pad, dates
 from orchpad.model import KINDS, PRIORITIES
 
 CACHE_TTL_SECONDS = 300
+
+FIELD_ACTIONS = ("due", "remind", "repeat", "notes", "url", "tags", "parent")
+
+_ADDED_FIELD_SCHEMA: dict[str, Any] = {
+    "due": {
+        "type": "string",
+        "description": (
+            "ISO date/datetime, today, tomorrow, mon..sun, +3d, +2w or +1h."
+        ),
+    },
+    "remind_at": {
+        "type": "string",
+        "description": "Reminder datetime or relative time such as +1h.",
+    },
+    "repeat": {
+        "type": "string",
+        "description": (
+            "none, daily, weekdays, weekly, monthly, yearly, "
+            "'every N days' or 'every N weeks'."
+        ),
+    },
+    "notes": {"type": "string", "description": "Multi-line notes body."},
+    "url": {"type": "string", "description": "Reference URL."},
+    "tags": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Tags without the leading '#'.",
+    },
+    "parent": {
+        "type": "integer",
+        "description": "Parent task id for a subtask.",
+    },
+}
 
 _RULE = (
     "The pad is for the orchestrator's own follow-ups, ideas, observations "
@@ -62,6 +95,7 @@ ADD_SCHEMA: dict[str, Any] = {
             "enum": list(PRIORITIES),
             "description": "Task priority: 1 normal, 2 medium, 3 high.",
         },
+        **_ADDED_FIELD_SCHEMA,
     },
     "required": ["description"],
     "additionalProperties": False,
@@ -82,13 +116,21 @@ UPDATE_SCHEMA: dict[str, Any] = {
                 "move",
                 "delete",
                 "restore",
+                *FIELD_ACTIONS,
             ],
         },
         "value": {
             "description": (
-                "Action value: priority (1-3), edit text, or a board-name list "
-                "for move. Not used by check/begin/star/delete/restore."
+                "Action value: priority (1-3), edit text, a board-name list "
+                "for move, or the new value for due/remind/repeat/notes/url/"
+                "tags/parent. Not used by check/begin/star/delete/restore."
             )
+        },
+        **_ADDED_FIELD_SCHEMA,
+        "force": {
+            "type": "boolean",
+            "default": False,
+            "description": "Check a parent task even when subtasks are open.",
         },
     },
     "required": ["id", "action"],
@@ -101,7 +143,10 @@ LIST_SCHEMA: dict[str, Any] = {
         "filters": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Status, kind, 'starred' or board-name filters.",
+            "description": (
+                "Status, kind, 'starred', 'archived', 'today', 'overdue', "
+                "'upcoming', 'scheduled', '#tag' or board-name filters."
+            ),
         },
         "board": {"type": "string", "description": "Board-name shorthand."},
         "include_archived": {
@@ -253,24 +298,79 @@ class OrchpadTools:
         description: str = "",
         boards: Sequence[str] | None = None,
         priority: int | None = None,
+        *,
+        due: str | None = None,
+        remind_at: str | None = None,
+        repeat: str | None = None,
+        notes: str | None = None,
+        url: str | None = None,
+        tags: Sequence[str] | None = None,
+        parent: int | None = None,
     ) -> dict[str, Any]:
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+        fields = self._prepare_fields(
+            {
+                "due": due,
+                "remind_at": remind_at,
+                "repeat": repeat,
+                "notes": notes,
+                "url": url,
+                "tags": tags,
+                "parent": parent,
+            }
+        )
         if kind == "note":
             if priority not in (None, 1):
                 raise ValueError("notes cannot have a priority")
-            item = self.pad.add_note(description, boards=boards)
+            item = self.pad.add_note(description, boards=boards, **fields)
         else:
             value = 1 if priority is None else priority
-            item = self.pad.add_task(description, boards=boards, priority=value)
+            item = self.pad.add_task(
+                description, boards=boards, priority=value, **fields
+            )
         return item.to_dict()
 
+    @staticmethod
+    def _prepare_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+        prepared: dict[str, Any] = {}
+        for key, value in fields.items():
+            if value is None:
+                if key in (
+                    "due",
+                    "remind_at",
+                    "repeat",
+                    "notes",
+                    "url",
+                    "tags",
+                    "parent",
+                ):
+                    prepared[key] = None
+                continue
+            if key == "due":
+                prepared[key] = dates.parse_due(value)
+            elif key == "remind_at":
+                prepared[key] = dates.parse_remind_at(value)
+            elif key == "repeat":
+                prepared[key] = dates.parse_repeat_token(value)
+            elif key == "tags":
+                prepared[key] = list(value)
+            else:
+                prepared[key] = value
+        return prepared
+
     def update(
-        self, item_id: int, action: str, value: Any = None
+        self,
+        item_id: int,
+        action: str,
+        value: Any = None,
+        *,
+        fields: Mapping[str, Any] | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         pad = self.pad
         if action == "check":
-            item = pad.check(item_id)[0]
+            item = pad.check(item_id, force=force)[0]
         elif action == "begin":
             item = pad.begin(item_id)[0]
         elif action == "star":
@@ -291,8 +391,14 @@ class OrchpadTools:
             item = pad.delete(item_id)[0]
         elif action == "restore":
             item = pad.restore(item_id)[0]
+        elif action in FIELD_ACTIONS:
+            key = "remind_at" if action == "remind" else action
+            prepared = self._prepare_fields({key: value})
+            item = pad.edit_fields(item_id, **prepared)
         else:
             raise ValueError(f"unknown action {action!r}")
+        if fields:
+            item = pad.edit_fields(item_id, **self._prepare_fields(fields))
         return item.to_dict()
 
     def list(
@@ -454,15 +560,39 @@ def build_handlers(tools: OrchpadTools) -> dict[str, Callable[..., str]]:
                     description=args.get("description", ""),
                     boards=args.get("boards"),
                     priority=args.get("priority"),
+                    due=args.get("due"),
+                    remind_at=args.get("remind_at"),
+                    repeat=args.get("repeat"),
+                    notes=args.get("notes"),
+                    url=args.get("url"),
+                    tags=args.get("tags"),
+                    parent=args.get("parent"),
                 )
             }
         )
 
     def update(args: Mapping[str, Any], **_: Any) -> str:
+        fields = {
+            key: args[key]
+            for key in (
+                "due",
+                "remind_at",
+                "repeat",
+                "notes",
+                "url",
+                "tags",
+                "parent",
+            )
+            if key in args
+        }
         return _json_result(
             lambda: {
                 "item": tools.update(
-                    args["id"], args["action"], args.get("value")
+                    args["id"],
+                    args["action"],
+                    args.get("value"),
+                    fields=fields,
+                    force=bool(args.get("force", False)),
                 )
             }
         )

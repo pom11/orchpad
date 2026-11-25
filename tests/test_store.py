@@ -49,7 +49,7 @@ def test_schema_shape_on_disk(tmp_path):
     path = tmp_path / "pad"
     Pad(path).add_task("one")
     raw = json.loads((path / "storage.json").read_text())
-    assert raw["version"] == 1
+    assert raw["version"] == SCHEMA_VERSION
     assert raw["next_id"] == 2
     assert list(raw["items"]) == ["1"]
     assert raw["items"]["1"]["description"] == "one"
