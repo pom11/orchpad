@@ -24,6 +24,7 @@ from . import __version__, dates
 from .model import DEFAULT_BOARD, Item
 from .pad import Pad, order_subtasks
 from .store import Store, StoreError
+from .sync_reminders import DIRECTIONS, SyncError, run_sync
 
 _RESET = "\x1b[0m"
 _BOLD_CYAN = "\x1b[1;36m"
@@ -1282,6 +1283,139 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
     raise UserError(f"unknown command {action!r}")  # pragma: no cover
 
 
+def _build_sync_parser() -> _Parser:
+    parser = _Parser(
+        prog="orchpad sync reminders",
+        description=(
+            "Sync mapped boards with Apple Reminders (macOS). Dry run by "
+            "default; only --apply writes. Only lists named with --map or "
+            "saved in sync.json are read or written."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="BOARD=LIST",
+        help="map one orchpad board to one Reminders list (repeatable)",
+    )
+    parser.add_argument(
+        "--pad-dir",
+        metavar="DIR",
+        help="use this pad directory (default: $ORCHPAD_HOME or ~/.orchpad)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the planned changes (default is a dry run)",
+    )
+    parser.add_argument(
+        "--direction",
+        choices=DIRECTIONS,
+        default="both",
+        help="sync direction (default: both)",
+    )
+    parser.add_argument(
+        "--exclude-list",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="refuse to sync this Reminders list (repeatable)",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="save the given --map entries in <pad>/sync.json",
+    )
+    parser.add_argument("--json", action="store_true", help="emit the plan as JSON")
+    return parser
+
+
+def _render_sync_plan(payload: dict[str, Any], out: TextIO) -> None:
+    counts = payload["counts"]
+    mode = "applied" if payload["apply"] else "dry run"
+    out.write(f"Reminders sync ({payload['direction']}, {mode})\n")
+    for mapping in payload["mappings"]:
+        out.write(
+            f"  board {mapping['board']!r} <-> list {mapping['list']!r}\n"
+        )
+    for action in payload["actions"]:
+        label = "Reminders" if action["side"] == "reminders" else "pad"
+        reference = (
+            f"#{action['item_id']}"
+            if action["item_id"] is not None
+            else (action["reminder_id"] or action["title"])
+        )
+        out.write(
+            f"  {action['action']:<17} {label}: {reference} "
+            f"{action['title']!r}"
+        )
+        if action["reason"]:
+            out.write(f" ({action['reason']})")
+        out.write("\n")
+    for warning in payload["warnings"]:
+        out.write(f"  warning: {warning}\n")
+    for skipped in payload["skipped"]:
+        out.write(f"  skip: {skipped}\n")
+    for failure in payload.get("failures", []):
+        reference = (
+            f"#{failure['item_id']}"
+            if failure.get("item_id") is not None
+            else (failure.get("reminder_id") or failure.get("title"))
+        )
+        out.write(
+            f"  FAILED {failure['action']:<17} {reference} "
+            f"{failure['title']!r}: {failure['error']}\n"
+        )
+    if not payload["actions"]:
+        out.write("Nothing to do.\n")
+        return
+    summary = (
+        f"{counts['total']} action{'s' if counts['total'] != 1 else ''}: "
+        f"{counts['to_reminders']} to Reminders, "
+        f"{counts['to_orchpad']} to the pad."
+    )
+    if payload["apply"]:
+        failed = len(payload.get("failures", []))
+        if failed:
+            applied = counts["total"] - failed
+            out.write(
+                f"{applied} of {counts['total']} actions applied; "
+                f"{failed} failed. Re-run --apply to retry the failures.\n"
+            )
+        else:
+            out.write(f"Applied {summary}\n")
+    else:
+        out.write(f"{summary} Dry run; nothing written. Use --apply to write.\n")
+
+
+def _run_sync_command(
+    argv: Sequence[str], out: TextIO, backend: Any = None
+) -> int:
+    if not argv or argv[0] != "reminders":
+        raise UserError("usage: orchpad sync reminders --map BOARD=LIST [--apply]")
+    parser = _build_sync_parser()
+    args = parser.parse_args(list(argv[1:]))
+    pad = Pad(args.pad_dir) if args.pad_dir else Pad()
+    payload = run_sync(
+        pad,
+        args.map,
+        apply=args.apply,
+        direction=args.direction,
+        exclude_lists=args.exclude_list,
+        save=args.save,
+        backend=backend,
+    )
+    if args.json:
+        _write_json(out, payload)
+    else:
+        _render_sync_plan(payload, out)
+    # Every other item was still applied; a failed item makes the run fail.
+    return 1 if payload.get("failures") else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
 
@@ -1289,6 +1423,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments and arguments[0] in ("show", "watch"):
             return _run_show_command(arguments, sys.stdout)
+        if arguments and arguments[0] == "sync":
+            return _run_sync_command(arguments[1:], sys.stdout)
         parser = _build_parser()
         args = parser.parse_args(arguments)
         return _dispatch(args, sys.stdout)
@@ -1296,6 +1432,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = exc.code
         return code if isinstance(code, int) else 1
     except UserError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except SyncError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyError as exc:
