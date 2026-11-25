@@ -309,13 +309,24 @@ def test_stats_flag(env):
     assert "50% of all tasks complete · 1 done · 0 in progress · 1 pending · 0 notes" in human.stdout
 
 
-def test_pad_dir_flag(env):
-    result = run(env, "--pad-dir")
+def test_where_flag(env):
+    result = run(env, "--where")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == env["ORCHPAD_HOME"]
-    machine = run(env, "--pad-dir", "--json")
+    machine = run(env, "--where", "--json")
     assert json.loads(machine.stdout)["path"] == env["ORCHPAD_HOME"]
     assert not Path(env["ORCHPAD_HOME"]).exists()
+
+
+def test_pad_dir_selects_another_pad(env, tmp_path):
+    other = tmp_path / "other-pad"
+    added = run(env, "--pad-dir", str(other), "-t", "elsewhere")
+    assert added.returncode == 0, added.stderr
+    assert (other / "storage.json").is_file()
+    shown = run(env, "--pad-dir", str(other), "--json")
+    assert "elsewhere" in shown.stdout
+    default = run(env, "--json")
+    assert "elsewhere" not in default.stdout
 
 
 def test_version_flag(env):
@@ -335,6 +346,7 @@ def test_help_flag(env):
             "--check",
             "--json",
             "--pad-dir",
+            "--where",
             "--stats",
             "--timeline",
             "exit codes",
@@ -352,7 +364,7 @@ def test_every_read_view_json_parses(env):
         ("-f", "json", "--json"),
         ("-i", "--json"),
         ("--stats", "--json"),
-        ("--pad-dir", "--json"),
+        ("--where", "--json"),
     ):
         result = run(env, *args)
         assert result.returncode == 0, (args, result.stderr)

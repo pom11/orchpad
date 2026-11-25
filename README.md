@@ -61,7 +61,7 @@ restore. Unknown ids raise `KeyError`. `delete` and `clear` write to
 
 Installing the package puts two equivalent console scripts on `PATH`,
 `orchpad` and `op`. `python -m orchpad` works without installing the scripts.
-Pads live in `$ORCHPAD_HOME` or `~/.orchpad`; `--pad-dir` prints the location
+Pads live in `$ORCHPAD_HOME` or `~/.orchpad`; `--pad-dir DIR` picks another pad and `--where` prints the location
 in use.
 
 ```sh
@@ -90,7 +90,7 @@ are removed from the stored description. Commands take comma-separated ids
 (`op -c 1,2`) and a leading `@` is optional (`op -c @1`).
 
 Every read view supports `--json` for machine use: the board view, `--archive`,
-`--list`, `--find`, `--timeline`, `--stats` and `--pad-dir`. Writes also accept
+`--list`, `--find`, `--timeline`, `--stats` and `--where`. Writes also accept
 `--json` and return the affected items. Read views end with a footer such as:
 
 ```

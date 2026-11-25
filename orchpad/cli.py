@@ -328,7 +328,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--priority", nargs=2, metavar=("ID", "N"), help="set priority 1, 2 or 3")
     parser.add_argument("-r", "--restore", nargs="+", metavar="ID", help="restore archived items")
     parser.add_argument("-s", "--star", nargs="+", metavar="ID", help="toggle the star")
-    parser.add_argument("--pad-dir", action="store_true", help="print the pad directory")
+    parser.add_argument("--pad-dir", metavar="DIR", help="use this pad directory (default: $ORCHPAD_HOME or ~/.orchpad)")
+    parser.add_argument("--where", action="store_true", help="print the pad directory")
     parser.add_argument("-t", "--task", nargs="+", metavar="DESCRIPTION", help="add a task")
     parser.add_argument("-i", "--timeline", action="store_true", help="group active items by creation date")
     parser.add_argument("--stats", action="store_true", help="show task counts")
@@ -338,7 +339,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
-    pad = Pad()
+    pad = Pad(args.pad_dir) if args.pad_dir else Pad()
     symbols = _UNICODE_SYMBOLS if _use_unicode(out) else _ASCII_SYMBOLS
     color = _use_color(out)
 
@@ -353,7 +354,7 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
         "list": args.list is not None,
         "move": args.move is not None,
         "note": args.note is not None,
-        "pad_dir": args.pad_dir,
+        "where": args.where,
         "priority": args.priority is not None,
         "restore": args.restore is not None,
         "star": args.star is not None,
@@ -385,7 +386,7 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
             _render_boards(pad.boards(), stats, symbols, color, out)
         return 0
 
-    if action == "pad_dir":
+    if action == "where":
         if args.json:
             _write_json(out, {"path": str(pad.path)})
         else:
