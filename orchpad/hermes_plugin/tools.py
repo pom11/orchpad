@@ -231,14 +231,14 @@ class OrchpadTools:
         *,
         runner: Runner | None = None,
         cache_ttl: float = CACHE_TTL_SECONDS,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.pad_path = (
             Path(pad_path).expanduser() if pad_path is not None else default_pad_path()
         )
         self._runner = runner or run_hermes
         self._cache_ttl = cache_ttl
-        self._clock = clock
+        self._clock = clock or time.monotonic
         self._status_cache: dict[str, tuple[float, str | None]] = {}
 
     @property
