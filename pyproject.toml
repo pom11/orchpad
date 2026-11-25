@@ -26,6 +26,7 @@ dependencies = []
 [project.scripts]
 orchpad = "orchpad.cli:main"
 op = "orchpad.cli:main"
+orchpad-hermes = "orchpad.hermes_plugin.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -35,6 +36,8 @@ Homepage = "https://github.com/pom11/orchpad"
 
 [tool.hatch.build.targets.wheel]
 packages = ["orchpad"]
+# plugin.yaml is data, not a module; make sure it ships inside the wheel.
+artifacts = ["orchpad/hermes_plugin/plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

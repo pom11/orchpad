@@ -104,6 +104,25 @@ symbols get an ASCII fallback (`[ ]`, `[x]`, `[~]`, `*`).
 Exit codes: `0` success, `1` user error (unknown id, empty description, bad
 flag), `2` store error (unreadable or corrupt pad files).
 
+## Hermes plugin
+
+Every Hermes profile keeps its own pad at `<profile home>/orchpad/`. The
+package ships the plugin and a small installer as a separate console script,
+so the main `orchpad` CLI and the core library never import Hermes:
+
+```sh
+orchpad-hermes --hermes-home ~/.hermes --profile coder
+```
+
+`--profile` is optional and defaults to the profile at the Hermes home itself;
+`--json` prints the install summary for machine use. Re-running the installer
+is idempotent and only rewrites files whose contents changed.
+
+The plugin exposes `orchpad_add`, `orchpad_update`, `orchpad_list` and
+`orchpad_promote`. The pad is for the orchestrator's own follow-ups, ideas,
+observations and waiting-on items; real work for a worker is promoted to a
+kanban card, which is linked back onto the pad item.
+
 ## Python API
 
 | Method | Purpose |

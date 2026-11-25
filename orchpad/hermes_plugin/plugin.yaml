@@ -1,0 +1,10 @@
+name: orchpad
+version: 0.1.0
+description: "Per-profile orchpad for the orchestrator's own follow-ups, ideas, observations and waiting-on items. Real work for a worker is promoted to a kanban card."
+author: orchpad contributors
+kind: standalone
+provides_tools:
+  - orchpad_add
+  - orchpad_update
+  - orchpad_list
+  - orchpad_promote
