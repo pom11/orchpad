@@ -1,13 +1,35 @@
 # orchpad
 
-A persistent, lightweight task and notes pad for agent orchestrators: boards,
-tasks, notes, priorities, an archive with restore, and a timeline. Pure Python,
-no dependencies, one JSON store per pad written atomically.
+Tasks, boards and notes for the command line, in Python. orchpad is a port of
+[taskbook](https://github.com/klaudiosinani/taskbook) (MIT) with the same flat
+flag syntax (`-t`, `-n`, `-c`, `-b`, `@board`, `p:3`, ...) and a number of
+features taskbook does not have.
 
-Ships with a Hermes plugin so each orchestrator profile keeps its own pad, and
-a read-only overview across pads for a supervising orchestrator.
+Pure Python 3.10+, no runtime dependencies, one JSON store per pad.
 
-Status: early development.
+## Features
+
+From taskbook:
+
+- tasks and notes organised into boards, with priorities and stars
+- board view, timeline view, search, filtered lists
+- archive on delete, with restore (same id)
+
+Added in orchpad:
+
+- **crash-safe storage**: every write is atomic (temp file, fsync, rename) and
+  a move between the active list and the archive can never lose an item
+- **safe for concurrent writers**: a file lock serialises processes that share a pad
+- **`--json` on every view**, for scripts and agents
+- **`orchpad show` / `orchpad watch`**: one screen with everything, for one pad
+  or many (`--all-under DIR`), built to run under `watch` or on its own loop
+- **multiple pads**: `--pad-dir DIR` or `$ORCHPAD_HOME`
+- **links**: attach references (a ticket, a PR, a kanban card) to any item
+- **a Python API** (`from orchpad import Pad`)
+- **optional integrations**: a [Hermes](#integrations) agent plugin that gives
+  each agent profile its own pad and can promote an item to a kanban card
+
+Status: early development (0.1.x).
 
 ## Install
 
@@ -107,7 +129,9 @@ symbols get an ASCII fallback (`[ ]`, `[x]`, `[~]`, `*`).
 Exit codes: `0` success, `1` user error (unknown id, empty description, bad
 flag), `2` store error (unreadable or corrupt pad files).
 
-## Hermes plugin
+## Integrations
+
+### Hermes plugin
 
 Every Hermes profile keeps its own pad at `<profile home>/orchpad/`. The
 package ships the plugin and a small installer as a separate console script,
@@ -182,3 +206,8 @@ directory, flushed, `fsync`ed, atomically replaced, then the directory is
 `fsync`ed. Corrupt files raise `orchpad.StoreError` and are never overwritten.
 
 Design inspired by [taskbook](https://github.com/klaudiosinani/taskbook) (MIT).
+
+## Credits
+
+orchpad started as a Python port of [taskbook](https://github.com/klaudiosinani/taskbook)
+by Klaudio Sinani (MIT). See LICENSE.
