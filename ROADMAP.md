@@ -6,8 +6,8 @@
 - [ ] Hermes plugin: per-profile pad, agent tools, promote-to-kanban (O3)
 
 ## Next
-- [ ] hscc: bootstrap installs orchpad and enables the plugin for orchestrator profiles only
-- [ ] hscc: read-only overview across all orchestrator pads for the main orchestrator
+- [ ] Bootstrap installs orchpad and enables the plugin for orchestrator profiles only
+- [ ] Read-only overview across all orchestrator pads for the main orchestrator
 
 ## Later
 - [ ] PyPI release
