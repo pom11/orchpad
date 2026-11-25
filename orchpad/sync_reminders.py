@@ -513,11 +513,19 @@ def canonical_when(value: str | None) -> str | None:
     )
 
 
+def _offset_text(canonical: str) -> str:
+    """Spell UTC as ``+00:00``: ``fromisoformat`` before 3.11 rejects ``Z``."""
+
+    if canonical.endswith("Z"):
+        return canonical[:-1] + "+00:00"
+    return canonical
+
+
 def _due_for_item(value: str | None) -> str | None:
     canonical = canonical_when(value)
     if canonical is None or len(canonical) == 10:
         return canonical
-    return canonical
+    return _offset_text(canonical)
 
 
 def _remind_for_item(value: str | None) -> str | None:
@@ -526,7 +534,7 @@ def _remind_for_item(value: str | None) -> str | None:
         return None
     if len(canonical) == 10:
         return f"{canonical}T00:00:00+00:00"
-    return canonical
+    return _offset_text(canonical)
 
 
 def _timestamp_for_item(value: str | None) -> str | None:
@@ -536,8 +544,8 @@ def _timestamp_for_item(value: str | None) -> str | None:
     if canonical is None:
         return None
     if len(canonical) == 10:
-        return f"{canonical}T00:00:00Z"
-    return canonical
+        return f"{canonical}T00:00:00+00:00"
+    return _offset_text(canonical)
 
 
 def item_fingerprint(item: Item) -> dict[str, Any]:

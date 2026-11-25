@@ -198,7 +198,7 @@ def test_completed_reminder_imports_as_done(pad):
     sync(pad, backend, apply=True)
     item = pad.list()[0]
     assert item.status == "done"
-    assert item.completed_at == "2026-11-01T00:00:00Z"
+    assert item.completed_at == "2026-11-01T00:00:00+00:00"
 
 
 def test_notes_are_skipped_and_reported(pad):
@@ -302,7 +302,7 @@ def test_complete_from_reminder(pad):
     sync(pad, backend, apply=True)
     item = pad.list()[0]
     assert item.status == "done"
-    assert item.completed_at == "2026-11-20T10:00:00Z"
+    assert item.completed_at == "2026-11-20T10:00:00+00:00"
 
 
 def test_conflict_most_recent_side_wins(pad):
