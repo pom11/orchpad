@@ -198,7 +198,6 @@ class Pad:
         parent: int | None = None,
     ) -> Item:
         description = validate_description(description)
-        board_list = normalize_boards(boards)
         with self.store.transaction() as transaction:
             items = self._load_active(transaction)
             if parent is not None:
@@ -206,6 +205,11 @@ class Pad:
                     raise KeyError(parent)
                 if items[parent].kind != "task":
                     raise ValueError(f"item {parent} is a note, not a task")
+                # Subtasks live on their parent's boards unless the new
+                # item names boards of its own.
+                if boards is None:
+                    boards = items[parent].boards
+            board_list = normalize_boards(boards)
             item_id = transaction.active["next_id"]
             stamp = utcnow()
             item = Item(
@@ -559,8 +563,9 @@ class Pad:
 
         All given filters must match.  ``archived`` selects archived items
         instead of active ones; ``today``, ``overdue``, ``upcoming`` and
-        ``scheduled`` filter by due date; ``#tag`` filters by tag; any other
-        unknown value is treated as a board name.
+        ``scheduled`` filter by due date and show open tasks only unless
+        combined with ``done``; ``#tag`` filters by tag; any other unknown
+        value is treated as a board name.
         """
 
         filters: list[str] = []
@@ -575,6 +580,16 @@ class Pad:
             else self._active_items()
         )
         moment = self._now()
+        date_views = {"today", "overdue", "upcoming", "scheduled"}
+        if (
+            any(attr in date_views for attr in filters)
+            and "done" not in filters
+        ):
+            items = [
+                item
+                for item in items
+                if item.status in ("pending", "in_progress")
+            ]
         for attr in filters:
             if attr in STATUSES:
                 items = [item for item in items if item.status == attr]

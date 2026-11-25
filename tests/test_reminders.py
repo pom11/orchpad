@@ -257,6 +257,18 @@ def test_subtasks_and_parent_force(pad):
     }
 
 
+def test_subtask_inherits_parent_boards(pad):
+    parent = pad.add_task("parent", boards=["hscc", "release"])
+    child = pad.add_task("child", parent=parent.id)
+    assert child.boards == ["hscc", "release"]
+
+    override = pad.add_task("own boards", boards=["other"], parent=parent.id)
+    assert override.boards == ["other"]
+
+    note = pad.add_note("note child", parent=parent.id)
+    assert note.boards == ["hscc", "release"]
+
+
 def test_subtask_requires_an_existing_task(pad):
     note = pad.add_note("just a note")
     with pytest.raises(KeyError):
@@ -317,6 +329,34 @@ def test_due_filters(pad):
         far.id,
     ]
     assert unscheduled.id not in {item.id for item in pad.list("scheduled")}
+
+
+def test_due_filters_show_open_tasks_only(pad):
+    done_today = pad.add_task("done today", due="2026-11-25")
+    open_today = pad.add_task("open today", due="2026-11-25")
+    done_overdue = pad.add_task("done overdue", due="2026-11-24")
+    done_upcoming = pad.add_task("done upcoming", due="2026-11-27")
+    for item in (done_today, done_overdue, done_upcoming):
+        pad.check(item.id)
+
+    assert [item.id for item in pad.list("today")] == [open_today.id]
+    assert pad.list("overdue") == []
+    assert pad.list("upcoming") == []
+    assert [item.id for item in pad.list("scheduled")] == [open_today.id]
+
+    # ``done`` opts the date views back into closed items.
+    assert [item.id for item in pad.list("today", "done")] == [done_today.id]
+    assert [item.id for item in pad.list("overdue", "done")] == [
+        done_overdue.id
+    ]
+    assert [item.id for item in pad.list("upcoming", "done")] == [
+        done_upcoming.id
+    ]
+    assert {item.id for item in pad.list("scheduled", "done")} == {
+        done_today.id,
+        done_overdue.id,
+        done_upcoming.id,
+    }
 
 
 def test_tag_filter(pad):

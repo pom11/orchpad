@@ -567,6 +567,64 @@ def test_subtask_flag_and_force_check(env):
     assert json.loads(forced.stdout)["items"][0]["status"] == "done"
 
 
+def test_subtask_inherits_parent_boards_and_renders_nested(env):
+    parent = add_task_json(env, "parent alpha", "@hscc")
+    subtask = run(
+        env, "--sub", str(parent["id"]), "child beta", "--json"
+    )
+    assert subtask.returncode == 0, subtask.stderr
+    child = json.loads(subtask.stdout)["item"]
+    assert child["parent"] == parent["id"]
+    assert child["boards"] == ["hscc"]
+
+    override = run(
+        env, "--sub", str(parent["id"]), "override gamma", "@other", "--json"
+    )
+    assert override.returncode == 0, override.stderr
+    assert json.loads(override.stdout)["item"]["boards"] == ["other"]
+
+    listed = json.loads(run(env, "-l", "--json").stdout)["items"]
+    by_id = {item["id"]: item for item in listed}
+    assert by_id[child["id"]]["parent"] == parent["id"]
+    assert by_id[child["id"]]["boards"] == ["hscc"]
+
+    board_view = run(env)
+    assert board_view.returncode == 0, board_view.stderr
+    board_lines = board_view.stdout.splitlines()
+    parent_line = next(line for line in board_lines if "parent alpha" in line)
+    child_line = next(line for line in board_lines if "child beta" in line)
+    assert board_lines.index(parent_line) < board_lines.index(child_line)
+    assert parent_line.startswith("    1.")
+    assert child_line.startswith("      2.")
+    assert "My Board" not in board_view.stdout
+
+    list_view = run(env, "-l")
+    assert list_view.returncode == 0, list_view.stderr
+    list_lines = list_view.stdout.splitlines()
+    parent_line = next(line for line in list_lines if "parent alpha" in line)
+    child_line = next(line for line in list_lines if "child beta" in line)
+    assert list_lines.index(parent_line) < list_lines.index(child_line)
+    assert parent_line.startswith("  1.")
+    assert child_line.startswith("    2.")
+    assert "[hscc]" in parent_line and "[hscc]" in child_line
+
+
+def test_date_views_skip_done_tasks_unless_done_requested(env):
+    done = add_task_json(env, "finished tomorrow", "due:tomorrow")
+    add_task_json(env, "open tomorrow", "due:tomorrow")
+    checked = run(env, "-c", str(done["id"]))
+    assert checked.returncode == 0, checked.stderr
+
+    def descriptions(*filters):
+        payload = json.loads(run(env, "-l", *filters, "--json").stdout)
+        return {item["description"] for item in payload["items"]}
+
+    assert descriptions("upcoming") == {"open tomorrow"}
+    assert descriptions("scheduled") == {"open tomorrow"}
+    assert descriptions("upcoming", "done") == {"finished tomorrow"}
+    assert descriptions("scheduled", "done") == {"finished tomorrow"}
+
+
 def test_repeating_check_creates_next_occurrence(env):
     add_task(env, "daily standup", "due:today", "every:day")
     result = run(env, "-c", "1", "--json")

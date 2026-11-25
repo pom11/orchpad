@@ -76,17 +76,18 @@ reminder = pad.add_task(
     url="https://example.invalid/rent",
     tags=["home", "money"],
 )
-subtask = pad.add_task("find the card", parent=reminder.id)
+subtask = pad.add_task("find the card", parent=reminder.id)  # same boards
 pad.set_due(reminder.id, "2026-12-02")
 pad.set_tags(reminder.id, ["home"])
 pad.edit_fields(reminder.id, notes="changed", url=None)
 
 pad.list("work")            # active items on a board
 pad.list("done", "task")    # filters combine
-pad.list("today")           # due today
-pad.list("overdue")         # past due
-pad.list("upcoming")        # due in the next seven days
-pad.list("scheduled")       # has a due date
+pad.list("today")           # open tasks due today
+pad.list("overdue")         # open tasks past due
+pad.list("upcoming")        # open tasks due in the next seven days
+pad.list("scheduled")       # open tasks with a due date
+pad.list("upcoming", "done")  # add done to include closed tasks
 pad.list("#home")           # has a tag
 pad.find("release")         # case-insensitive substring search
 pad.boards()                # {board: [items]}
@@ -101,6 +102,7 @@ pad.clear()                 # archive every done task
 Checking a repeating task keeps the done item and creates the next pending
 occurrence with `due` and `remind_at` advanced. Checking a parent that still has
 open subtasks raises an error unless `force=True` (`--force` on the CLI).
+A new subtask inherits its parent's boards unless it names its own `@board`.
 
 Every id is unique per pad and is never reused, including after deletion and
 restore. Unknown ids raise `KeyError`. `delete` and `clear` write to
