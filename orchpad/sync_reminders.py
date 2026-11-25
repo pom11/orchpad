@@ -946,8 +946,10 @@ def build_plan(
                     _create_item_action(board, list_name, reminder)
                 )
 
-        for item in board_items:
-            if item.id not in paired_items and item.kind == "task":
+        if push:
+            for item in board_items:
+                if item.kind != "task":
+                    continue
                 if item.repeat:
                     plan.warnings.append(
                         f"#{item.id}: repeat rules stay orchpad-only; JXA "
