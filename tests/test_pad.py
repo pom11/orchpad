@@ -349,6 +349,15 @@ def test_env_home_sets_default_path(tmp_path, monkeypatch):
     assert (home / "storage.json").exists()
 
 
+def test_home_falls_back_to_dot_orchpad(tmp_path, monkeypatch):
+    monkeypatch.delenv("ORCHPAD_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pad = Pad()
+    assert pad.path == tmp_path / ".orchpad"
+    pad.add_task("via home")
+    assert (tmp_path / ".orchpad" / "storage.json").exists()
+
+
 def test_corrupt_store_surfaces(pad):
     pad.add_task("one")
     (pad.path / "storage.json").write_text("{oops")
