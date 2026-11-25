@@ -82,6 +82,9 @@ op -d 1                         # archive
 op -a                           # show the archive
 op -r 1                         # restore from the archive
 op --clear                      # archive every done task
+op show                         # one screen with everything
+op show --all-under DIR         # every pad below DIR, one section each
+op watch                        # redraw show until Ctrl+C
 ```
 
 New tasks and notes accept `@board` tokens anywhere in the description to
@@ -122,6 +125,38 @@ The plugin exposes `orchpad_add`, `orchpad_update`, `orchpad_list` and
 `orchpad_promote`. The pad is for the orchestrator's own follow-ups, ideas,
 observations and waiting-on items; real work for a worker is promoted to a
 kanban card, which is linked back onto the pad item.
+
+## Watching a pad
+
+`orchpad show [PAD_DIR ...]` prints one screen with every board and item in a
+pad, then a footer with the combined stats. Each line carries the status
+symbol, description, priority, star, age and any `kanban` link. It is
+read-only (a shared lock, never an item write) and deterministic: boards are
+sorted by name with the default board first, items by status (in progress,
+pending, done, notes), priority descending, then id. Descriptions are
+truncated with an ellipsis to fit `--width` (default: the terminal width, or
+100 when there is no terminal).
+
+`--all-under DIR` finds every `*/orchpad/` pad below `DIR` and prints one
+section per pad, headed by the pad directory's parent name, with a combined
+footer. `--archived` adds archived items (marked `[archived]`), `--json` emits
+the same data for machines, and `--color auto|always|never` controls ANSI
+colour. A pad with no items prints `Empty pad.` and exits `0`.
+
+For a live view, use the system `watch` command with forced colour:
+
+```sh
+watch -c orchpad show --color always
+```
+
+Stock macOS has no `watch`; use the built-in loop instead. It clears the
+screen, redraws whenever the pad files change (or every 30 seconds), and exits
+`0` on Ctrl+C:
+
+```sh
+orchpad watch
+orchpad watch --all-under DIR -n 1
+```
 
 ## Python API
 

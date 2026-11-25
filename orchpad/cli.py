@@ -11,13 +11,18 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
-from typing import Any, Iterable, Sequence, TextIO
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence, TextIO
 
 from . import __version__
-from .model import Item
+from .model import DEFAULT_BOARD, Item
 from .pad import Pad
-from .store import StoreError
+from .store import Store, StoreError
 
 _RESET = "\x1b[0m"
 _BOLD_CYAN = "\x1b[1;36m"
@@ -45,6 +50,10 @@ _ASCII_SYMBOLS = {
 }
 
 _PRIORITY_TOKEN = re.compile(r"^p:([123])$")
+
+_SHOW_CLEAR = "\x1b[2J\x1b[H"
+_REDRAW_SECONDS = 30.0
+_STATUS_RANK = {"in_progress": 0, "pending": 1, "done": 2, None: 3}
 
 
 class UserError(Exception):
@@ -221,6 +230,471 @@ def _render_timeline(
     out.write(_paint(_footer(stats, symbols), _DIM, color) + "\n")
 
 
+# -- show and watch ---------------------------------------------------------
+
+
+@dataclass
+class _PadView:
+    """Everything read from one pad for the show view."""
+
+    path: Path
+    name: str
+    boards: dict[str, list[Item]]
+    stats: dict[str, int]
+
+
+def _now() -> datetime:
+    """Current time used to render item ages (patched in tests)."""
+
+    return datetime.now(timezone.utc)
+
+
+def _terminal_width() -> int:
+    columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+    return columns if columns > 0 else 100
+
+
+def _format_age(created_at: str, now: datetime) -> str:
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:  # pragma: no cover - store validation prevents this
+        return "?"
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    seconds = int((now - created).total_seconds())
+    if seconds < 60:
+        return "now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def _items_stats(items: Iterable[Item]) -> dict[str, int]:
+    items = list(items)
+    done = sum(1 for item in items if item.status == "done")
+    in_progress = sum(1 for item in items if item.status == "in_progress")
+    pending = sum(1 for item in items if item.status == "pending")
+    notes = sum(1 for item in items if item.kind == "note")
+    tasks = done + in_progress + pending
+    return {
+        "done": done,
+        "in_progress": in_progress,
+        "pending": pending,
+        "notes": notes,
+        "percent_done": round(done * 100 / tasks) if tasks else 0,
+        "tasks": tasks,
+        "total": tasks + notes,
+    }
+
+
+def _combine_stats(views: Sequence[_PadView]) -> dict[str, int]:
+    combined = _items_stats(())
+    for view in views:
+        for key in ("done", "in_progress", "pending", "notes"):
+            combined[key] += view.stats[key]
+    tasks = combined["done"] + combined["in_progress"] + combined["pending"]
+    combined["tasks"] = tasks
+    combined["total"] = tasks + combined["notes"]
+    combined["percent_done"] = (
+        round(combined["done"] * 100 / tasks) if tasks else 0
+    )
+    return combined
+
+
+def _discover_pads(root: Path) -> list[Path]:
+    """Find every ``*/orchpad/`` pad directory below ``root``."""
+
+    if not root.is_dir():
+        return []
+    try:
+        candidates = list(root.rglob("orchpad"))
+    except OSError:  # pragma: no cover - unreadable subtrees
+        candidates = []
+    pads = [candidate for candidate in candidates if candidate.is_dir()]
+    return sorted(pads, key=lambda path: str(path))
+
+
+def _resolve_pad_paths(
+    pad_args: Sequence[str], all_under: Sequence[str]
+) -> list[Path]:
+    paths = [Path(value).expanduser() for value in pad_args]
+    for value in all_under:
+        paths.extend(_discover_pads(Path(value).expanduser()))
+    if not pad_args and not all_under:
+        paths = [Pad().path]
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:  # pragma: no cover - broken symlinks
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _pad_name(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - broken symlinks
+        resolved = path
+    return resolved.parent.name or resolved.name or str(path)
+
+
+def _show_sort_key(item: Item) -> tuple[int, int, int]:
+    return (_STATUS_RANK[item.status], -item.priority, item.id)
+
+
+def _read_pad(path: Path, include_archived: bool) -> _PadView:
+    path = Path(path).expanduser()
+    name = _pad_name(path)
+    if not path.is_dir():
+        # A show must never create a pad directory just to display it.
+        return _PadView(path, name, {}, _items_stats(()))
+    if not (
+        (path / "storage.json").is_file()
+        or (path / "archive.json").is_file()
+    ):
+        # An empty pad directory: nothing to lock and nothing to write.
+        return _PadView(path, name, {}, _items_stats(()))
+
+    store = Store(path)
+    active_document, archive_document = store.snapshot()
+    active = [
+        Item.from_dict(raw) for raw in active_document["items"].values()
+    ]
+    items = list(active)
+    if include_archived:
+        items.extend(
+            Item.from_dict(raw)
+            for raw in archive_document["items"].values()
+        )
+
+    boards: dict[str, list[Item]] = {}
+    for item in items:
+        for board in item.boards:
+            boards.setdefault(board, []).append(item)
+    ordered = sorted(
+        boards,
+        key=lambda board: (board != DEFAULT_BOARD, board.casefold(), board),
+    )
+    for board in ordered:
+        boards[board].sort(key=_show_sort_key)
+    return _PadView(
+        path,
+        name,
+        {board: boards[board] for board in ordered},
+        _items_stats(active),
+    )
+
+
+def _item_color_code(item: Item) -> str:
+    if item.kind == "note":
+        return _DIM
+    return {
+        "done": _GREEN,
+        "in_progress": _YELLOW,
+        "pending": (
+            _RED
+            if item.priority == 3
+            else _BLUE if item.priority == 2 else ""
+        ),
+    }.get(item.status or "pending", "")
+
+
+def _format_show_item(
+    item: Item,
+    symbols: dict[str, str],
+    color: bool,
+    width: int,
+    now: datetime,
+) -> str:
+    symbol = (
+        symbols["note"]
+        if item.kind == "note"
+        else symbols[item.status or "pending"]
+    )
+    description = item.description.replace("\r", " ").replace("\n", " ")
+    extras: list[str] = []
+    if item.kind == "task" and item.priority > 1:
+        extras.append(f"p{item.priority}")
+    if item.starred:
+        extras.append(symbols["star"])
+    extras.append(_format_age(item.created_at, now))
+    kanban = item.links.get("kanban")
+    if kanban:
+        extras.append(f"kanban:{kanban}")
+    if item.archived_at:
+        extras.append("[archived]")
+    prefix = f"  {item.id:>3}. {symbol} "
+    suffix = " " + " ".join(extras)
+    available = width - len(prefix) - len(suffix)
+    if available <= 0:
+        description = ""
+    elif len(description) > available:
+        ellipsis = "…" if symbols is _UNICODE_SYMBOLS else "..."
+        if available <= len(ellipsis):
+            description = ellipsis[:available]
+        else:
+            description = (
+                description[: available - len(ellipsis)].rstrip() + ellipsis
+            )
+    return _paint(
+        prefix + description + suffix, _item_color_code(item), color
+    )
+
+
+def _render_show(
+    views: Sequence[_PadView],
+    symbols: dict[str, str],
+    color: bool,
+    width: int,
+    out: TextIO,
+    *,
+    now: datetime | None = None,
+) -> None:
+    if not views:
+        out.write("No pads found.\n")
+        return
+    moment = now or _now()
+    multiple = len(views) > 1
+    for index, view in enumerate(views):
+        if multiple:
+            if index:
+                out.write("\n")
+            out.write(_paint(f"== {view.name} ==", _BOLD_CYAN, color) + "\n")
+        if not view.boards:
+            out.write("Empty pad.\n")
+            continue
+        for board_index, (board, items) in enumerate(view.boards.items()):
+            if board_index:
+                out.write("\n")
+            out.write(_paint(board, _BOLD_CYAN, color) + "\n")
+            for item in items:
+                out.write(
+                    _format_show_item(item, symbols, color, width, moment)
+                    + "\n"
+                )
+    out.write(
+        "\n" + _paint(_footer(_combine_stats(views), symbols), _DIM, color) + "\n"
+    )
+
+
+def _show_payload(views: Sequence[_PadView]) -> dict[str, Any]:
+    return {
+        "pads": [
+            {
+                "name": view.name,
+                "path": str(view.path),
+                "boards": [
+                    {"name": board, "items": _item_dicts(items)}
+                    for board, items in view.boards.items()
+                ],
+                "stats": dict(view.stats),
+            }
+            for view in views
+        ],
+        "stats": _combine_stats(views),
+    }
+
+
+def _width_arg(value: str) -> int:
+    try:
+        width = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("width must be an integer") from exc
+    if width < 20:
+        raise argparse.ArgumentTypeError("width must be at least 20")
+    return width
+
+
+def _interval_arg(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("interval must be a number") from exc
+    if interval <= 0:
+        raise argparse.ArgumentTypeError("interval must be positive")
+    return interval
+
+
+def _build_show_parser(prog: str) -> _Parser:
+    parser = _Parser(
+        prog=prog,
+        description=(
+            "Show every board and item in one or more pads, ready for watch."
+        ),
+        epilog=(
+            "examples:\n"
+            "  orchpad show\n"
+            "  orchpad show --all-under DIR\n"
+            "  watch -c orchpad show --color always\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "pads",
+        nargs="*",
+        metavar="PAD_DIR",
+        help="pad directories (default: $ORCHPAD_HOME or ~/.orchpad)",
+    )
+    parser.add_argument(
+        "--all-under",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="find every */orchpad/ pad below DIR",
+    )
+    parser.add_argument(
+        "-a", "--archived", action="store_true", help="include archived items"
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="ANSI colour: auto (TTY only), always or never",
+    )
+    parser.add_argument(
+        "--width",
+        type=_width_arg,
+        default=None,
+        metavar="N",
+        help="line width (default: terminal width, or 100)",
+    )
+    return parser
+
+
+def _build_watch_parser() -> _Parser:
+    parser = _build_show_parser("orchpad watch")
+    parser.description = (
+        "Redraw 'orchpad show' until Ctrl+C, only when the pad files change "
+        "or every 30 seconds."
+    )
+    parser.add_argument(
+        "-n",
+        "--interval",
+        type=_interval_arg,
+        default=2.0,
+        metavar="SECONDS",
+        help="poll interval in seconds (default: 2)",
+    )
+    return parser
+
+
+def _show_options(
+    args: argparse.Namespace, out: TextIO
+) -> tuple[dict[str, str], bool, int]:
+    symbols = _UNICODE_SYMBOLS if _use_unicode(out) else _ASCII_SYMBOLS
+    if args.color == "always":
+        color = True
+    elif args.color == "never":
+        color = False
+    else:
+        color = _use_color(out)
+    width = args.width if args.width is not None else _terminal_width()
+    return symbols, color, width
+
+
+def _run_show(args: argparse.Namespace, out: TextIO) -> int:
+    symbols, color, width = _show_options(args, out)
+    paths = _resolve_pad_paths(args.pads, args.all_under)
+    views = [_read_pad(path, args.archived) for path in paths]
+    if args.json:
+        _write_json(out, _show_payload(views))
+    else:
+        _render_show(views, symbols, color, width, out)
+    return 0
+
+
+def _store_mtimes(paths: Sequence[Path]) -> tuple[int, ...]:
+    stamps: list[int] = []
+    for path in paths:
+        for name in ("storage.json", "archive.json"):
+            try:
+                stamps.append((path / name).stat().st_mtime_ns)
+            except OSError:
+                stamps.append(0)
+    return tuple(stamps)
+
+
+def _watch_loop(
+    draw: Callable[[], None],
+    mtimes: Callable[[], tuple[int, ...]],
+    *,
+    interval: float,
+    out: TextIO,
+    iterations: int | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    redraw_seconds: float = _REDRAW_SECONDS,
+) -> int:
+    """Poll and redraw until interrupted, a test cap, or Ctrl+C."""
+
+    last_mtimes: tuple[int, ...] | None = None
+    last_draw: float | None = None
+    polls = 0
+    try:
+        while iterations is None or polls < iterations:
+            current_time = clock()
+            current_mtimes = mtimes()
+            if (
+                last_draw is None
+                or current_mtimes != last_mtimes
+                or current_time - last_draw >= redraw_seconds
+            ):
+                out.write(_SHOW_CLEAR)
+                draw()
+                out.flush()
+                last_draw = current_time
+                last_mtimes = current_mtimes
+            polls += 1
+            if iterations is not None and polls >= iterations:
+                break
+            sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def _run_watch(args: argparse.Namespace, out: TextIO) -> int:
+    symbols, color, width = _show_options(args, out)
+    paths = _resolve_pad_paths(args.pads, args.all_under)
+
+    def draw() -> None:
+        views = [_read_pad(path, args.archived) for path in paths]
+        if args.json:
+            _write_json(out, _show_payload(views))
+        else:
+            _render_show(views, symbols, color, width, out)
+
+    return _watch_loop(
+        draw,
+        lambda: _store_mtimes(paths),
+        interval=args.interval,
+        out=out,
+    )
+
+
+def _run_show_command(argv: Sequence[str], out: TextIO) -> int:
+    parser = (
+        _build_watch_parser()
+        if argv[0] == "watch"
+        else _build_show_parser("orchpad show")
+    )
+    args = parser.parse_args(argv[1:])
+    if argv[0] == "watch":
+        return _run_watch(args, out)
+    return _run_show(args, out)
+
+
 def _parse_input(
     values: Sequence[str], *, task: bool
 ) -> tuple[str, list[str] | None, int]:
@@ -309,6 +783,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  orchpad -p 1 3      # set priority\n"
             "  orchpad -f release  # find\n"
             "  orchpad --stats --json\n"
+            "  orchpad show        # everything, watch-friendly\n"
+            "  orchpad watch       # redraw show until Ctrl+C\n"
             "\n"
             "exit codes: 0 ok, 1 user error, 2 store error\n"
         ),
@@ -585,14 +1061,16 @@ def _dispatch(args: argparse.Namespace, out: TextIO) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
 
-    parser = _build_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = parser.parse_args(argv)
+        if arguments and arguments[0] in ("show", "watch"):
+            return _run_show_command(arguments, sys.stdout)
+        parser = _build_parser()
+        args = parser.parse_args(arguments)
+        return _dispatch(args, sys.stdout)
     except SystemExit as exc:  # --help / --version / usage errors
         code = exc.code
         return code if isinstance(code, int) else 1
-    try:
-        return _dispatch(args, sys.stdout)
     except UserError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
