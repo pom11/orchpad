@@ -145,6 +145,8 @@ function run(argv) {
     if (value === null || value === undefined) return null;
     var d = value instanceof Date ? value : new Date(value);
     if (isNaN(d.getTime())) return null;
+    // Some Reminders versions report a cleared date as 1 Jan 1904.
+    if (d.getFullYear() <= 1904) return null;
     var offset = -d.getTimezoneOffset();
     var sign = offset >= 0 ? '+' : '-';
     var abs = Math.abs(offset);
@@ -153,33 +155,113 @@ function run(argv) {
       sign + pad(Math.floor(abs / 60)) + ':' + pad(abs % 60);
   }
 
-  function toDate(value) {
+  // Build Date objects explicitly instead of handing ISO strings to
+  // Date.parse: an invalid or mis-parsed date then surfaces as a clear error
+  // here rather than as Apple's opaque "Can't convert types" (-1700).
+  function toDate(value, label) {
     if (value === null || value === undefined || value === '') return null;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-      var parts = value.split('-').map(Number);
-      return new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    if (value instanceof Date) {
+      if (isNaN(value.getTime())) {
+        throw new Error(label + ': invalid date');
+      }
+      return value;
     }
-    return new Date(value);
+    var text = String(value).trim();
+    var match = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?(Z|[+-]\d{2}:\d{2})?$/.exec(text);
+    if (!match) {
+      throw new Error(label + ": unsupported date '" + text + "'");
+    }
+    var year = Number(match[1]);
+    var month = Number(match[2]);
+    var day = Number(match[3]);
+    var hour = Number(match[4] || '0');
+    var minute = Number(match[5] || '0');
+    var second = Number(match[6] || '0');
+    var fraction = match[7] || '';
+    while (fraction.length < 3) fraction += '0';
+    var milli = Number(fraction || '0');
+    var offset = match[8];
+    var stamp;
+    if (offset) {
+      var utc = Date.UTC(year, month - 1, day, hour, minute, second, milli);
+      if (offset !== 'Z') {
+        var sign = offset.charAt(0) === '-' ? -1 : 1;
+        var bits = offset.substring(1).split(':');
+        utc -= sign * (Number(bits[0]) * 60 + Number(bits[1])) * 60000;
+      }
+      stamp = new Date(utc);
+    } else {
+      stamp = new Date(year, month - 1, day, hour, minute, second, milli);
+      // Reject dates that JavaScript silently rolled over (Feb 30, etc.).
+      if (
+        stamp.getFullYear() !== year ||
+        stamp.getMonth() !== month - 1 ||
+        stamp.getDate() !== day ||
+        stamp.getHours() !== hour ||
+        stamp.getMinutes() !== minute ||
+        stamp.getSeconds() !== second
+      ) {
+        throw new Error(label + ": invalid date '" + text + "'");
+      }
+    }
+    if (isNaN(stamp.getTime())) {
+      throw new Error(label + ": invalid date '" + text + "'");
+    }
+    return stamp;
   }
 
-  function modifiedDate(reminder) {
-    try { return localIso(reminder.modificationDate()); } catch (error) { return null; }
+  function sameMoment(left, right) {
+    if (!left || !right) return !left && !right;
+    var a = left instanceof Date ? left : new Date(left);
+    var b = right instanceof Date ? right : new Date(right);
+    return a.getTime() === b.getTime();
   }
 
-  function serialize(reminder) {
-    return {
-      id: reminder.id(),
-      list_name: request.list,
-      title: reminder.name(),
-      body: reminder.body() || '',
-      due: localIso(reminder.dueDate()),
-      remind: localIso(reminder.remindMeDate()),
-      priority: reminder.priority(),
-      flagged: reminder.flagged(),
-      completed: reminder.completed(),
-      completed_at: localIso(reminder.completionDate()),
-      modified_at: modifiedDate(reminder)
-    };
+  // Read every field through the list's bulk property arrays.  Per-element
+  // accessors are pathologically slow on current macOS (tens of seconds per
+  // call), while these bulk reads take about a second each.
+  function serializeAll(list) {
+    var ids = list.reminders.id();
+    var names = list.reminders.name();
+    var bodies = list.reminders.body();
+    var dues = list.reminders.dueDate();
+    var reminds = list.reminders.remindMeDate();
+    var priorities = list.reminders.priority();
+    var flags = list.reminders.flagged();
+    var completions = list.reminders.completed();
+    var completionDates = list.reminders.completionDate();
+    var modifieds = list.reminders.modificationDate();
+    var result = [];
+    for (var index = 0; index < ids.length; index++) {
+      result.push({
+        id: String(ids[index]),
+        list_name: request.list,
+        title: names[index] == null ? '' : String(names[index]),
+        body: bodies[index] == null ? '' : String(bodies[index]),
+        due: localIso(dues[index]),
+        remind: localIso(reminds[index]),
+        priority: Number(priorities[index] || 0),
+        flagged: flags[index] === true,
+        completed: completions[index] === true,
+        completed_at: localIso(completionDates[index]),
+        modified_at: localIso(modifieds[index])
+      });
+    }
+    return result;
+  }
+
+  function findById(items, id) {
+    for (var index = 0; index < items.length; index++) {
+      if (items[index].id === id) return index;
+    }
+    return -1;
+  }
+
+  function containsId(ids, id) {
+    for (var index = 0; index < ids.length; index++) {
+      if (String(ids[index]) === id) return true;
+    }
+    return false;
   }
 
   function listByName(name) {
@@ -198,45 +280,111 @@ function run(argv) {
     throw new Error("no Reminders list named '" + name + "'");
   }
 
-  function writeFields(reminder, fields) {
-    reminder.name = fields.title;
-    reminder.body = fields.body || '';
-    reminder.dueDate = fields.due ? toDate(fields.due) : null;
-    reminder.remindMeDate = fields.remind ? toDate(fields.remind) : null;
-    reminder.priority = fields.priority;
-    reminder.flagged = !!fields.flagged;
-    if (fields.completed) {
-      if (!reminder.completed()) reminder.completed = true;
-      if (fields.completed_at) reminder.completionDate = toDate(fields.completed_at);
-    } else if (reminder.completed()) {
-      reminder.completed = false;
+  function writeFields(reminder, fields, current) {
+    // Every property is written with the type Reminders' dictionary expects:
+    // strings for name/body, an integer priority (0 none, 1 high, 5 medium,
+    // 9 low), a boolean flag, and real Date objects for dates.  Only fields
+    // that differ are touched; each per-element write is expensive.
+    var title = fields.title == null ? '' : String(fields.title);
+    var body = fields.body == null ? '' : String(fields.body);
+    var priority = Number(fields.priority);
+    if (
+      !isFinite(priority) ||
+      (priority !== 0 && priority !== 1 && priority !== 5 && priority !== 9)
+    ) {
+      throw new Error('unsupported Reminders priority ' + fields.priority);
+    }
+    var flagged = fields.flagged === true;
+    var completed = fields.completed === true;
+    var due = toDate(fields.due, 'due');
+    var remind = toDate(fields.remind, 'remind');
+
+    if (!current || current.title !== title) reminder.name = title;
+    if (!current || current.body !== body) reminder.body = body;
+    if (!current || Number(current.priority) !== priority) {
+      reminder.priority = priority;
+    }
+    if (!current || current.flagged !== flagged) reminder.flagged = flagged;
+
+    // Assigning null raises -1700, so only real Date objects are written.
+    // A truly cleared date therefore keeps its value for this run; the pair
+    // stores the actual value, so the next run converges instead of
+    // retrying the impossible write forever.
+    if (due && (!current || !sameMoment(current.due, due))) {
+      reminder.dueDate = due;
+    }
+    if (remind && (!current || !sameMoment(current.remind, remind))) {
+      reminder.remindMeDate = remind;
+    }
+
+    // completionDate is read-only in the Reminders dictionary; `completed`
+    // is the writable switch and Reminders stamps the completion date itself.
+    if (!current || current.completed !== completed) {
+      try {
+        reminder.completed = completed;
+      } catch (error) {
+        throw new Error('completed: ' + (error && error.message ? error.message : error));
+      }
     }
   }
 
   if (request.op === 'fetch') {
-    return JSON.stringify(listByName(request.list).reminders().map(serialize));
+    return JSON.stringify(serializeAll(listByName(request.list)));
   }
   if (request.op === 'create') {
     var list = listByName(request.list);
-    var created = app.Reminder({name: request.reminder.title, body: request.reminder.body || ''});
+    var before = list.reminders.id();
+    var created = app.Reminder({name: request.reminder.title});
     list.reminders.push(created);
-    writeFields(created, request.reminder);
-    return JSON.stringify(serialize(created));
+    try {
+      writeFields(created, request.reminder, {
+        title: request.reminder.title == null ? '' : String(request.reminder.title),
+        body: '',
+        priority: 0,
+        flagged: false,
+        completed: false,
+        due: null,
+        remind: null
+      });
+    } catch (error) {
+      // Never leave a half-written reminder behind; the next run retries.
+      try { app.delete(created); } catch (ignored) {}
+      throw error;
+    }
+    var after = list.reminders.id();
+    var createdId = null;
+    for (var cursor = 0; cursor < after.length; cursor++) {
+      if (!containsId(before, String(after[cursor]))) {
+        createdId = String(after[cursor]);
+      }
+    }
+    if (createdId === null) createdId = String(created.id());
+    var stored = serializeAll(list);
+    var at = findById(stored, createdId);
+    if (at === -1) {
+      throw new Error("created reminder '" + createdId + "' is not in the list");
+    }
+    return JSON.stringify(stored[at]);
   }
   if (request.op === 'update' || request.op === 'delete') {
     var target = listByName(request.list);
-    var existing = target.reminders();
-    for (var index = 0; index < existing.length; index++) {
-      if (existing[index].id() === request.reminder.id) {
-        if (request.op === 'delete') {
-          app.delete(existing[index]);
-          return JSON.stringify({deleted: request.reminder.id});
-        }
-        writeFields(existing[index], request.reminder);
-        return JSON.stringify(serialize(existing[index]));
-      }
+    var current = serializeAll(target);
+    var found = findById(current, request.reminder.id);
+    if (found === -1) {
+      throw new Error("no reminder with id '" + request.reminder.id + "' in list '" + request.list + "'");
     }
-    throw new Error("no reminder with id '" + request.reminder.id + "' in list '" + request.list + "'");
+    var existing = target.reminders()[found];
+    if (request.op === 'delete') {
+      app.delete(existing);
+      return JSON.stringify({deleted: request.reminder.id});
+    }
+    writeFields(existing, request.reminder, current[found]);
+    var refreshed = serializeAll(target);
+    var updatedAt = findById(refreshed, request.reminder.id);
+    if (updatedAt === -1) {
+      throw new Error("reminder '" + request.reminder.id + "' disappeared after update");
+    }
+    return JSON.stringify(refreshed[updatedAt]);
   }
   throw new Error("unknown op '" + request.op + "'");
 }
@@ -694,6 +842,7 @@ class Plan:
     changes: list[Change] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    failures: list[dict[str, Any]] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         to_reminders = sum(1 for change in self.changes if change.side == "reminders")
@@ -714,6 +863,7 @@ class Plan:
             "actions": [change.to_dict() for change in self.changes],
             "skipped": list(self.skipped),
             "warnings": list(self.warnings),
+            "failures": [dict(failure) for failure in self.failures],
             "counts": self.counts(),
         }
 
@@ -1186,18 +1336,40 @@ def apply_plan(
     pad: Pad,
     state: SyncState,
     state_path: Path,
-) -> None:
-    """Execute every change, persisting pair state even on a late failure."""
+) -> list[dict[str, Any]]:
+    """Execute changes independently, persisting only successful pairs.
 
+    A failure on one item (for example an Apple Reminders type error) is
+    recorded and the remaining items are still attempted.  The pair state is
+    rolled back for that item, so a re-run retries exactly the failed work
+    and then converges.  Returns the list of failures.
+    """
+
+    failures: list[dict[str, Any]] = []
     ordered = sorted(
         plan.changes, key=lambda change: _APPLY_ORDER.get(change.action, 9)
     )
     try:
         for change in ordered:
-            _apply_change(change, backend, pad, state)
+            snapshot = dict(state.pairs)
+            try:
+                _apply_change(change, backend, pad, state)
+            except Exception as exc:  # one bad item must not abort the sync
+                state.pairs = snapshot
+                failures.append(
+                    {
+                        **change.to_dict(),
+                        "error": str(exc) or exc.__class__.__name__,
+                    }
+                )
     finally:
+        # Only successful changes touched the state; failures were rolled
+        # back above.  The write itself is atomic.
         save_state(state_path, state)
+
     plan.apply = True
+    plan.failures = failures
+    return failures
 
 
 # ---------------------------------------------------------------------------

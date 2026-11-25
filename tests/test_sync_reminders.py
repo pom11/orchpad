@@ -612,3 +612,193 @@ def test_jxa_backend_uses_osascript_javascript(monkeypatch):
     assert json.loads(calls[0][-1]) == {"op": "fetch", "list": "Orchpad"}
     assert reminders[0].title == "remote"
     assert reminders[0].id == "x-apple-reminder://1"
+
+
+# ---------------------------------------------------------------------------
+# Backend type mapping and per-item resilience
+
+
+class StrictBackend(FakeBackend):
+    """Fake backend that only accepts values JXA can coerce losslessly."""
+
+    def _validate(self, reminder):
+        assert type(reminder.priority) is int
+        assert reminder.priority in (0, 1, 5, 9)
+        assert type(reminder.flagged) is bool
+        assert type(reminder.completed) is bool
+        assert reminder.due is None or isinstance(reminder.due, str)
+        assert reminder.remind is None or isinstance(reminder.remind, str)
+        assert reminder.completed_at is None or isinstance(
+            reminder.completed_at, str
+        )
+
+    def create(self, list_name, reminder):
+        self._validate(reminder)
+        return super().create(list_name, reminder)
+
+    def update(self, reminder):
+        self._validate(reminder)
+        return super().update(reminder)
+
+
+def test_reminder_payload_types_match_apples_dictionary(pad):
+    expected = {1: 0, 2: 5, 3: 1}
+    for priority in (1, 2, 3):
+        item = pad.add_task(
+            f"p{priority}",
+            ["Work"],
+            priority=priority,
+            due="2026-12-04",
+            remind_at="2026-12-04T09:30:00+01:00",
+        )
+        reminder = sync_reminders.reminder_for_item(item, "Orchpad")
+        assert reminder.priority == expected[priority]
+        assert type(reminder.priority) is int
+        assert type(reminder.flagged) is bool
+        assert type(reminder.completed) is bool
+
+    item = pad.add_task("done", ["Work"], priority=3, due="2026-12-05")
+    item = pad.star(item.id)[0]
+    done = pad.check(item.id)[0]
+    reminder = sync_reminders.reminder_for_item(done, "Orchpad")
+    assert reminder.priority == 1
+    assert reminder.flagged is True
+    assert reminder.completed is True
+    payload = json.loads(json.dumps(reminder.to_dict()))
+    assert payload["priority"] == 1
+    assert type(payload["priority"]) is int
+    assert payload["completed"] is True
+    assert payload["completed_at"] == done.completed_at
+    assert payload["due"] == "2026-12-05"
+
+
+def test_strict_backend_accepts_completed_and_pending_payloads(pad):
+    done = pad.add_task(
+        "done", ["Work"], priority=2, due="2026-12-06", notes="n"
+    )
+    pad.check(done.id)
+    pad.add_task("pending", ["Work"], priority=3, due="2026-12-07")
+    backend = StrictBackend({"Orchpad": []})
+
+    payload = sync(pad, backend, apply=True)
+    assert payload["failures"] == []
+    stored = backend.by_title("Orchpad")
+    assert stored["done"].completed is True
+    assert stored["done"].priority == 5
+    assert stored["pending"].completed is False
+    assert stored["pending"].priority == 1
+    assert sync(pad, backend)["actions"] == []
+
+
+class FailingBackend(FakeBackend):
+    """Fake backend that fails on selected titles, like a bad JXA write."""
+
+    def __init__(self, lists=None, failing_titles=()):
+        super().__init__(lists)
+        self.failing_titles = set(failing_titles)
+        self.failed_calls = []
+
+    def _maybe_fail(self, operation, reminder):
+        if reminder.title in self.failing_titles:
+            self.failed_calls.append((operation, reminder.title))
+            raise SyncError(
+                "Apple Reminders error: execution error: Error: "
+                "Error: Can't convert types. (-1700)"
+            )
+
+    def create(self, list_name, reminder):
+        self._maybe_fail("create", reminder)
+        return super().create(list_name, reminder)
+
+    def update(self, reminder):
+        self._maybe_fail("update", reminder)
+        return super().update(reminder)
+
+
+def test_one_item_failure_is_reported_and_others_still_apply(pad):
+    for title in ("bad task", "good one", "good two"):
+        pad.add_task(title, ["Work"], due="2026-12-01")
+    backend = FailingBackend(
+        {"Orchpad": [Reminder("remote-1", "Orchpad", "remote task")]},
+        failing_titles={"bad task"},
+    )
+
+    payload = sync(pad, backend, apply=True)
+    assert len(payload["failures"]) == 1
+    failure = payload["failures"][0]
+    assert failure["action"] == "create-reminder"
+    assert failure["title"] == "bad task"
+    assert "Can't convert types" in failure["error"]
+
+    # Both the other pushes and the pull still happened.
+    assert backend.titles("Orchpad") == ["good one", "good two", "remote task"]
+    assert sorted(item.description for item in pad.list()) == [
+        "bad task",
+        "good one",
+        "good two",
+        "remote task",
+    ]
+    items = {item.id: item.description for item in pad.list()}
+    paired = sorted(items[pair["item_id"]] for pair in state_pairs(pad))
+    assert paired == ["good one", "good two", "remote task"]
+
+    # A re-run retries only the failed item, then converges.
+    backend.failing_titles.clear()
+    creates_before = backend.creates
+    retry = sync(pad, backend, apply=True)
+    assert retry["failures"] == []
+    assert backend.creates == creates_before + 1
+    assert backend.failed_calls == [("create", "bad task")]
+    assert len(state_pairs(pad)) == 4
+    assert sync(pad, backend)["actions"] == []
+
+
+def test_failed_update_keeps_previous_state_and_retries(pad):
+    item = pad.add_task("task", ["Work"])
+    backend = FailingBackend({"Orchpad": []})
+    sync(pad, backend, apply=True)
+    before = state_pairs(pad)
+
+    pad.edit_fields(item.id, notes="updated")
+    backend.failing_titles.add("task")
+    payload = sync(pad, backend, apply=True)
+    assert [failure["action"] for failure in payload["failures"]] == [
+        "update-reminder"
+    ]
+    assert state_pairs(pad) == before
+    assert backend.by_title("Orchpad")["task"].body == ""
+
+    backend.failing_titles.clear()
+    retry = sync(pad, backend, apply=True)
+    assert retry["failures"] == []
+    assert backend.by_title("Orchpad")["task"].body == "updated"
+    assert sync(pad, backend)["actions"] == []
+
+
+def test_cli_exits_one_when_an_item_fails(tmp_path, monkeypatch, capsys):
+    backend = FailingBackend({"Orchpad": []}, failing_titles={"bad task"})
+    monkeypatch.setattr(sync_reminders.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(sync_reminders, "_make_backend", lambda: backend)
+    pad_dir = tmp_path / "pad"
+    local = Pad(pad_dir)
+    local.add_task("bad task", ["Work"])
+    local.add_task("good task", ["Work"])
+
+    code = cli.main(
+        [
+            "sync",
+            "reminders",
+            "--map",
+            "Work=Orchpad",
+            "--pad-dir",
+            str(pad_dir),
+            "--apply",
+        ]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "FAILED create-reminder" in out
+    assert "Can't convert types" in out
+    assert "1 of 2 actions applied; 1 failed" in out
+    assert backend.titles("Orchpad") == ["good task"]
+    assert len(state_pairs(local)) == 1

@@ -1359,6 +1359,16 @@ def _render_sync_plan(payload: dict[str, Any], out: TextIO) -> None:
         out.write(f"  warning: {warning}\n")
     for skipped in payload["skipped"]:
         out.write(f"  skip: {skipped}\n")
+    for failure in payload.get("failures", []):
+        reference = (
+            f"#{failure['item_id']}"
+            if failure.get("item_id") is not None
+            else (failure.get("reminder_id") or failure.get("title"))
+        )
+        out.write(
+            f"  FAILED {failure['action']:<17} {reference} "
+            f"{failure['title']!r}: {failure['error']}\n"
+        )
     if not payload["actions"]:
         out.write("Nothing to do.\n")
         return
@@ -1368,7 +1378,15 @@ def _render_sync_plan(payload: dict[str, Any], out: TextIO) -> None:
         f"{counts['to_orchpad']} to the pad."
     )
     if payload["apply"]:
-        out.write(f"Applied {summary}\n")
+        failed = len(payload.get("failures", []))
+        if failed:
+            applied = counts["total"] - failed
+            out.write(
+                f"{applied} of {counts['total']} actions applied; "
+                f"{failed} failed. Re-run --apply to retry the failures.\n"
+            )
+        else:
+            out.write(f"Applied {summary}\n")
     else:
         out.write(f"{summary} Dry run; nothing written. Use --apply to write.\n")
 
@@ -1394,7 +1412,8 @@ def _run_sync_command(
         _write_json(out, payload)
     else:
         _render_sync_plan(payload, out)
-    return 0
+    # Every other item was still applied; a failed item makes the run fail.
+    return 1 if payload.get("failures") else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
