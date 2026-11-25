@@ -168,10 +168,13 @@ class Store:
         with self.lock():
             transaction = Transaction(self)
             yield transaction
-            if "active" in transaction.dirty:
-                self._write(self.active_path, transaction.active)
+            # Archive first: a crash between the two writes then leaves a
+            # deleted item in both documents (recoverable) instead of in
+            # neither (lost).
             if "archive" in transaction.dirty:
                 self._write(self.archive_path, transaction.archive)
+            if "active" in transaction.dirty:
+                self._write(self.active_path, transaction.active)
 
     def snapshot(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return a consistent ``(active, archive)`` snapshot."""
