@@ -271,14 +271,14 @@ def test_all_under_discovers_pads_and_ignores_non_pads(tmp_path, capsys):
     (profiles / "zoe" / "notes").mkdir(parents=True)
     (profiles / "dana" / "orchpad").mkdir(parents=True)
     _write_pad(
-        profiles / "team" / "claude" / "orchpad", [_item(1, "nested task")]
+        profiles / "team" / "carol" / "orchpad", [_item(1, "nested task")]
     )
 
     code, out = _show(
         capsys, "--all-under", str(profiles), "--color", "never"
     )
     assert code == 0
-    for name in ("alice", "bob", "claude"):
+    for name in ("alice", "bob", "carol"):
         assert f"== {name} ==" in out
     assert "zoe" not in out
     for text in ("alice task", "bob pending", "bob done", "nested task"):
