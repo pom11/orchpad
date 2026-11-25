@@ -183,13 +183,17 @@ function run(argv) {
   }
 
   function listByName(name) {
-    // Address a single list by name instead of enumerating every list, so
-    // unmapped lists are never even visited.
+    // Address a single list by name first, so unmapped lists are never
+    // enumerated in the normal path.
     try {
       var list = app.lists.byName(name);
       if (list && list.name() === name) return list;
     } catch (error) {
-      // fall through to the clear error below
+      // fall through to the name scan / clear error below
+    }
+    var lists = app.lists();
+    for (var index = 0; index < lists.length; index++) {
+      if (lists[index].name() === name) return lists[index];
     }
     throw new Error("no Reminders list named '" + name + "'");
   }
@@ -1223,6 +1227,14 @@ def run_sync(
     if direction not in DIRECTIONS:
         raise SyncError(f"direction must be one of {', '.join(DIRECTIONS)}")
 
+    # Refuse other platforms before anything else, even when the user has
+    # not supplied a mapping yet.
+    if backend is None and platform.system() != "Darwin":
+        raise SyncError(
+            "Apple Reminders sync requires macOS (osascript is only "
+            "available there)"
+        )
+
     state_path = state_path or pad.path / STATE_FILENAME
     maps_path = maps_path or pad.path / MAPS_FILENAME
 
@@ -1245,11 +1257,6 @@ def run_sync(
             )
 
     if backend is None:
-        if platform.system() != "Darwin":
-            raise SyncError(
-                "Apple Reminders sync requires macOS (osascript is only "
-                "available there)"
-            )
         backend = _make_backend()
 
     if save:

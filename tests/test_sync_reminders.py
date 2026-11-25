@@ -562,7 +562,8 @@ def test_cli_refuses_non_macos(tmp_path, monkeypatch, capsys):
     assert "macOS" in capsys.readouterr().err
 
 
-def test_cli_requires_a_mapping(tmp_path, capsys):
+def test_cli_requires_a_mapping(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sync_reminders.platform, "system", lambda: "Darwin")
     code = cli.main(
         ["sync", "reminders", "--pad-dir", str(tmp_path / "pad")]
     )
@@ -576,3 +577,38 @@ def test_corrupt_state_is_refused(pad):
     backend = FakeBackend({"Orchpad": []})
     with pytest.raises(SyncError, match="corrupt sync state"):
         sync(pad, backend)
+
+
+def test_jxa_backend_uses_osascript_javascript(monkeypatch):
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            [
+                {
+                    "id": "x-apple-reminder://1",
+                    "list_name": "Orchpad",
+                    "title": "remote",
+                    "body": "",
+                    "priority": 0,
+                    "flagged": False,
+                    "completed": False,
+                }
+            ]
+        )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return Completed()
+
+    monkeypatch.setattr(sync_reminders.subprocess, "run", fake_run)
+    backend = sync_reminders.JxaRemindersBackend()
+    reminders = backend.fetch("Orchpad")
+
+    assert calls[0][:3] == ["osascript", "-l", "JavaScript"]
+    assert calls[0][3] == "-e"
+    assert json.loads(calls[0][-1]) == {"op": "fetch", "list": "Orchpad"}
+    assert reminders[0].title == "remote"
+    assert reminders[0].id == "x-apple-reminder://1"
